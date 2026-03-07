@@ -421,9 +421,9 @@ def write_cerner_csv(rows: list[dict], filepath: Path,
 
 TEMPLATE_ROWS = [
     {"drug_name": "ExampleDrug_A", "concentration_mg_per_ml": 20,
-     "drug_type": "traditional", "min_dose_mg": 5, "max_dose_mg": 1060},
+     "drug_type": "traditional", "min_dose_mg": 200, "max_dose_mg": 1060},
     {"drug_name": "ExampleDrug_B", "concentration_mg_per_ml": 10,
-     "drug_type": "mab",         "min_dose_mg": 100, "max_dose_mg": 2000},
+     "drug_type": "mab",         "min_dose_mg": 400, "max_dose_mg": 2000},
 ]
 
 
