@@ -365,11 +365,9 @@ def build_bands(
             result = best_vial_dose_in_window(tol_low, tol_high, vial_combos)
             if result is not None:
                 v_dose, v_label, v_waste, v_waste_pct = result
+                vial_optimized = True
                 if abs(v_dose - D) > 1e-6:
-                    D            = v_dose
-                    vial_optimized = True
-                else:
-                    vial_optimized = False
+                    D = v_dose
                 vial_combo_label = v_label
                 # Annotate with ~ when vials are shared and waste is non-zero
                 if vials_shared and v_waste > 1e-9:
