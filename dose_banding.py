@@ -102,6 +102,19 @@ def geo_mean(a: float, b: float) -> float:
     return math.sqrt(a * b)
 
 
+def _count_vials(label: str) -> int:
+    """Count total vials in a combination label, e.g. '2x30mg + 1x60mg' → 3."""
+    total = 0
+    for part in label.split('+'):
+        part = part.strip()
+        if 'x' in part:
+            try:
+                total += int(part.split('x')[0])
+            except ValueError:
+                pass
+    return total
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # VIAL OPTIMISATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -209,8 +222,11 @@ def best_vial_dose_in_window(
         return None
 
     # All candidates are exact vial combinations → waste is 0 for all
-    # Prefer the largest dose in window (maximises band width / coverage)
-    best_dose, best_label = max(candidates, key=lambda x: x[0])
+    # Prefer the largest dose in window (maximises band width / coverage).
+    # Break ties by fewest total vials (simplest preparation).
+    best_dose = max(c[0] for c in candidates)
+    tied = [(dose, label) for dose, label in candidates if abs(dose - best_dose) < 1e-9]
+    best_dose, best_label = min(tied, key=lambda x: _count_vials(x[1]))
     waste_mg  = 0.0
     waste_pct = 0.0
 
@@ -386,7 +402,7 @@ def build_bands(
                     (dose, label) for dose, label in vial_combos if dose >= D - 1e-9
                 ]
                 if candidates_ge:
-                    v_dose, v_label = min(candidates_ge, key=lambda x: x[0])
+                    v_dose, v_label = min(candidates_ge, key=lambda x: (x[0], _count_vials(x[1])))
                     v_waste = round(v_dose - D, 4)
                     v_waste_pct = round(v_waste / D * 100, 1) if D > 0 else 0.0
                     vial_combo_label = v_label
