@@ -380,7 +380,25 @@ def build_bands(
                     round(v_waste * cost_per_mg, 2) if cost_per_mg is not None else ""
                 )
             else:
-                # No vial combination fits the window — standard fallback
+                # No zero-waste combination fits the tolerance window.
+                # Find the nearest vial combination >= band dose (minimum waste).
+                candidates_ge = [
+                    (dose, label) for dose, label in vial_combos if dose >= D - 1e-9
+                ]
+                if candidates_ge:
+                    v_dose, v_label = min(candidates_ge, key=lambda x: x[0])
+                    v_waste = round(v_dose - D, 4)
+                    v_waste_pct = round(v_waste / D * 100, 1) if D > 0 else 0.0
+                    vial_combo_label = v_label
+                    if vials_shared and v_waste > 1e-9:
+                        waste_mg      = f"~{v_waste:.1f}"
+                        waste_pct_val = f"~{v_waste_pct:.1f}"
+                    else:
+                        waste_mg      = round(v_waste, 1)
+                        waste_pct_val = round(v_waste_pct, 1)
+                    waste_cost_val = (
+                        round(v_waste * cost_per_mg, 2) if cost_per_mg is not None else ""
+                    )
                 vial_optimized = False
 
         # ── Volume ───────────────────────────────────────────────────────────
