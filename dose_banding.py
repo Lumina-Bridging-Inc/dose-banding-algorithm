@@ -40,6 +40,7 @@ import csv
 import math
 import sys
 from pathlib import Path
+from typing import Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VOLUME PRECISION TIERS
@@ -99,6 +100,121 @@ def ceil_to_step(value: float, step: float) -> float:
 
 def geo_mean(a: float, b: float) -> float:
     return math.sqrt(a * b)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VIAL OPTIMISATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_vial_sizes(raw: str) -> list[float]:
+    """
+    Parse the vial_sizes_mg CSV field into a sorted list of floats.
+    Returns [] if the field is absent, empty, or non-numeric.
+
+    Examples:
+      '100'       → [100.0]
+      '100,160'   → [100.0, 160.0]
+      ''          → []
+    """
+    if not raw or not str(raw).strip():
+        return []
+    sizes = []
+    for part in str(raw).split(','):
+        part = part.strip()
+        try:
+            v = float(part)
+            if v > 0:
+                sizes.append(v)
+        except ValueError:
+            pass  # ignore non-numeric entries gracefully
+    return sorted(sizes)
+
+
+def parse_vials_shared(raw: str) -> bool:
+    """
+    Parse the vials_shared CSV field.
+    Accepts 'yes' / 'no' (case-insensitive). Defaults to False.
+    """
+    return str(raw).strip().lower() in ("yes", "true", "1")
+
+
+def enumerate_vial_combinations(
+    vial_sizes:   list[float],
+    max_dose:     float,
+    max_per_size: int = 8,
+) -> list[tuple[float, str]]:
+    """
+    Return all achievable (dose_mg, label) pairs from combinations of vial_sizes.
+    Uses recursive enumeration across ALL vial sizes jointly — not independently.
+
+    This is essential: the combination 2x100mg + 1x160mg = 360mg is only
+    discoverable by iterating (n, m) pairs together, not in separate loops.
+
+    Args:
+        vial_sizes:   sorted list of vial sizes in mg, e.g. [100.0, 160.0]
+        max_dose:     upper ceiling — combinations above this are discarded
+        max_per_size: maximum number of vials of any single size (default 8)
+
+    Returns:
+        Sorted list of (total_dose_mg, label_string) tuples.
+        Label examples: '2x100mg', '1x160mg + 2x100mg'
+    """
+    results: list[tuple[float, str]] = []
+
+    def recurse(idx: int, current_dose: float, parts: list[str]) -> None:
+        if idx == len(vial_sizes):
+            if current_dose > 0:  # must use at least one vial
+                label = ' + '.join(parts) if parts else ''
+                results.append((current_dose, label))
+            return
+        size = vial_sizes[idx]
+        for n in range(0, max_per_size + 1):
+            new_dose = current_dose + n * size
+            if new_dose > max_dose + 1e-9:
+                break  # pruning: further n only increases dose
+            new_parts = parts.copy()
+            if n > 0:
+                new_parts.append(f'{n}x{size:g}mg')
+            recurse(idx + 1, new_dose, new_parts)
+
+    recurse(0, 0.0, [])
+
+    # Sort by dose, then by label (deterministic ordering)
+    results.sort(key=lambda x: (x[0], x[1]))
+    return results
+
+
+def best_vial_dose_in_window(
+    window_low:  float,
+    window_high: float,
+    vial_combos: list,
+) -> Optional[tuple]:
+    """
+    Find the best vial combination within [window_low, window_high].
+
+    Selection priority:
+      1. Zero-waste combinations — prefer the LARGEST (maximises band width).
+      2. If no zero-waste option: minimum-waste combination.
+      3. If no combination in window at all: return None (caller uses fallback).
+
+    Returns:
+        (dose_mg, label, waste_mg, waste_pct) or None
+    """
+    candidates = [
+        (dose, label)
+        for dose, label in vial_combos
+        if window_low - 1e-9 <= dose <= window_high + 1e-9
+    ]
+    if not candidates:
+        return None
+
+    # All candidates are exact vial combinations → waste is 0 for all
+    # Prefer the largest dose in window (maximises band width / coverage)
+    best_dose, best_label = max(candidates, key=lambda x: x[0])
+    waste_mg  = 0.0
+    waste_pct = 0.0
+
+    return (best_dose, best_label, waste_mg, waste_pct)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -169,7 +285,13 @@ def generate_band_doses(
 # BUILD FULL BAND TABLE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_bands(drug: dict) -> list[dict]:
+def build_bands(
+    drug:         dict,
+    vial_sizes:   Optional[list] = None,
+    max_per_vial: int = 8,
+    vials_shared: bool = False,
+    cost_per_mg:  Optional[float] = None,
+) -> list:
     """Return band-row dicts for one drug config entry."""
     name      = drug["drug_name"].strip()
     conc      = float(drug["concentration_mg_per_ml"])
@@ -183,6 +305,17 @@ def build_bands(drug: dict) -> list[dict]:
         )
 
     var        = VARIANCE[dtype]
+
+    # ── Vial optimisation setup ──────────────────────────────────────────────
+    use_vials = bool(vial_sizes)
+    vial_combos: list[tuple[float, str]] = []
+    if use_vials:
+        # Enumerate all combinations up to 10% above max_dose as ceiling.
+        ceiling = max_dose * 1.10
+        vial_combos = enumerate_vial_combinations(
+            vial_sizes, ceiling, max_per_vial
+        )
+
     band_doses = generate_band_doses(min_dose, max_dose, conc, var)
     n          = len(band_doses)
     rows: list[dict] = []
@@ -211,6 +344,46 @@ def build_bands(drug: dict) -> list[dict]:
             to_a_mg = math.floor(round(to_a_mg, 8) * 100) / 100
 
         to_b_mg = round(to_a_mg - 0.01, 2)   # Round-DOWN system boundary
+
+        # ── Vial optimisation ────────────────────────────────────────────────
+        # Attempt to substitute D with a zero-waste vial combination that
+        # falls within the tolerance window already established by from_mg
+        # and to_a_mg. The boundaries do NOT change — they define the window.
+        vial_combo_label = ""
+        waste_mg         = ""
+        waste_pct_val    = ""
+        waste_cost_val   = ""
+        vial_optimized   = ""
+
+        if use_vials:
+            # The band dose D must be within var% of every prescribed dose in
+            # [from_mg, to_a_mg]. The safe range for D is therefore:
+            #   D >= to_a_mg * (1 - var)   (avoid underdose at upper boundary)
+            #   D <= from_mg * (1 + var)   (avoid overdose at lower boundary)
+            tol_low  = to_a_mg * (1.0 - var)
+            tol_high = from_mg * (1.0 + var)
+            result = best_vial_dose_in_window(tol_low, tol_high, vial_combos)
+            if result is not None:
+                v_dose, v_label, v_waste, v_waste_pct = result
+                if abs(v_dose - D) > 1e-6:
+                    D            = v_dose
+                    vial_optimized = True
+                else:
+                    vial_optimized = False
+                vial_combo_label = v_label
+                # Annotate with ~ when vials are shared and waste is non-zero
+                if vials_shared and v_waste > 1e-9:
+                    waste_mg      = f"~{v_waste:.1f}"
+                    waste_pct_val = f"~{v_waste_pct:.1f}"
+                else:
+                    waste_mg      = round(v_waste, 1)
+                    waste_pct_val = round(v_waste_pct, 1)
+                waste_cost_val = (
+                    round(v_waste * cost_per_mg, 2) if cost_per_mg is not None else ""
+                )
+            else:
+                # No vial combination fits the window — standard fallback
+                vial_optimized = False
 
         # ── Volume ───────────────────────────────────────────────────────────
         volume_mL = round(D / conc, 4)
@@ -241,6 +414,12 @@ def build_bands(drug: dict) -> list[dict]:
             "variance_below_pct":      round(var_below_pct, 1),
             "variance_above_pct":      round(var_above_pct, 1),
             "within_tolerance":        within,
+            # vial optimisation fields — empty strings for drugs without vial sizes
+            "vial_combination":        vial_combo_label,
+            "waste_mg":                waste_mg,
+            "waste_pct":               waste_pct_val,
+            "waste_cost":              waste_cost_val,
+            "vial_optimized":          vial_optimized,
         })
 
     return rows
@@ -381,6 +560,8 @@ BAND_FIELDS = [
     "band_dose_mg", "volume_mL", "volume_step_mL",
     "from_mg", "to_a_mg", "to_b_mg",
     "variance_below_pct", "variance_above_pct", "within_tolerance",
+    # vial optimisation — empty strings for drugs without vial_sizes_mg
+    "vial_combination", "waste_mg", "waste_pct", "waste_cost", "vial_optimized",
 ]
 
 # ── Cerner Standardized Dose Range output format ────────────────────────────
@@ -502,7 +683,12 @@ def main() -> None:
         print(f"\n  ► {name}  ({conc} mg/mL, {dtype})")
 
         try:
-            bands = build_bands(drug)
+            vial_sizes   = parse_vial_sizes(drug.get("vial_sizes_mg", ""))
+            max_per_vial = int(drug.get("max_vials_per_size", 8) or 8)
+            vials_shared = parse_vials_shared(drug.get("vials_shared", "no"))
+            raw_cost     = drug.get("cost_per_mg", "")
+            cost_per_mg  = float(raw_cost) if raw_cost not in ("", None) else None
+            bands = build_bands(drug, vial_sizes, max_per_vial, vials_shared, cost_per_mg)
         except (ValueError, KeyError) as exc:
             print(f"    ERROR — skipping: {exc}", file=sys.stderr)
             continue
