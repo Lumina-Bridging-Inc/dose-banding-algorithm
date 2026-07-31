@@ -170,10 +170,61 @@ def table4_excerpt(rows: list[dict]) -> None:
               f"{float(r['band_dose_mg']):>12.4f} {'mg':>5}")
 
 
+def out_of_sample() -> None:
+    """
+    Out-of-sample validation against the NHS England 6 mg/mL Version 2 table
+    (paclitaxel, single container), which was not consulted during development
+    of the algorithm or of the volume-precision framework.
+    """
+    ref_path = Path("nhs_6mgml_ref.csv")
+    if not ref_path.exists():
+        print(f"\n  (skipping out-of-sample test — {ref_path} not found)")
+        return
+
+    ref = [(float(r["from_mg"]), float(r["to_a_mg"]), float(r["band_dose_mg"]))
+           for r in csv.DictReader(open(ref_path, encoding="utf-8"))]
+    conc, lo, hi = 6.0, ref[0][0], ref[-1][1]
+    rows = build_bands({"drug_name": "Paclitaxel",
+                        "concentration_mg_per_ml": conc, "drug_type": DTYPE,
+                        "min_dose_mg": lo, "max_dose_mg": hi})
+
+    print(f"\n{'=' * 74}\n  OUT-OF-SAMPLE: NHS England 6 mg/mL v2 (paclitaxel), "
+          f"{lo:g}–{hi:g} mg\n{'=' * 74}")
+
+    exact, deltas = 0, []
+    for _, _, dose in ref:
+        m = next((r for r in rows if float(r["from_mg"]) <= dose < float(r["to_a_mg"])), None)
+        if m is None:
+            continue
+        algo = float(m["band_dose_mg"])
+        deltas.append(abs(algo - dose) / dose * 100.0)
+        exact += abs(algo - dose) <= 0.05
+
+    worst = max(max(abs(r["variance_below_pct"]), abs(r["variance_above_pct"]))
+                for r in rows)
+    assert not verify_bands(rows, VAR, conc)
+    nhs_exc = [d for f, t, d in ref if (d - f) / f * 100 > 6.0 or abs((d - t) / t * 100) > 6.0]
+
+    print(f"  NHS bands / algorithm bands ....... {len(ref)} / {len(rows)}")
+    print(f"  Exact band dose agreement ......... {exact}/{len(ref)} "
+          f"= {exact / len(ref) * 100:.1f}%")
+    print(f"  NHS dose within ±{VAR * 100:g}% of algo band .. "
+          f"{sum(1 for x in deltas if x <= VAR * 100)}/{len(deltas)}")
+    print(f"  Mean / max divergence ............. {sum(deltas) / len(deltas):.2f}% "
+          f"/ {max(deltas):.2f}%")
+    print(f"  Algorithm max boundary variance ... {worst:.2f}%  (0 exceedances)")
+    print(f"  NHS bands over 6.00% .............. {len(nhs_exc)}  "
+          f"(doses {', '.join(f'{d:g}' for d in nhs_exc)})")
+
+    OUT.mkdir(parents=True, exist_ok=True)
+    write_band_csv(rows, OUT / "out_of_sample_6mgml_algorithm_bands.csv")
+
+
 def main() -> None:
     rows_380 = report(PAPER_MAX, "5-380mg")
     table4_excerpt(rows_380)
     report(FULL_MAX, "5-1058mg")
+    out_of_sample()
     print(f"\n  CSVs written to {OUT.resolve()}\n")
 
 

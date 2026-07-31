@@ -43,21 +43,29 @@ from pathlib import Path
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VOLUME PRECISION TIERS
-# Based on analysis of NHS England 20 mg/mL Version 7 reference table.
+# The tier structure was originally derived by analysis of the NHS England
+# 20 mg/mL Version 7 reference table; the graduation values themselves are
+# physical properties of the syringes in routine clinical use.
 # Tuple: (upper_volume_mL_exclusive, volume_step_mL)
+#
+# Revised 2026-07-31 after out-of-sample validation against the NHS England
+# 6 mg/mL Version 2 table (paclitaxel, single container). Earlier revisions
+# assumed 2.00 mL graduations for 50/60 mL syringes and a 5.00 mL increment
+# above 60 mL. Both were wrong: 50 and 60 mL syringes are graduated at 1 mL,
+# and volumes beyond a single syringe are drawn in successive aliquots, so
+# the achievable resolution stays at 1 mL rather than coarsening. The 6 mg/mL
+# table confirms this directly — all 33 of its band doses land on whole
+# millilitres, including at 128 mL. Those two tiers had never been exercised
+# by any validation: the 20 mg/mL comparison stops at 380 mg, i.e. 19 mL.
 # ─────────────────────────────────────────────────────────────────────────────
 VOLUME_PRECISION_TIERS: list[tuple[float, float]] = [
     # Small syringes: BD minor graduations per Jordan et al,
     # Hospital Pharmacy 2019 (PMC8114303), Table 1.
-    # Larger syringes (25, 50, 60 mL) use standard clinical graduations.
-    # Note: 20 mL and 25 mL share the same 1.00 mL minor graduation,
-    # so they are combined into one tier.
+    # 20 mL and larger syringes use standard clinical graduations of 1 mL.
     (1.0,          0.01),   # 1 mL syringe          minor grad: 0.01 mL
     (3.0,          0.10),   # 3 mL syringe          minor grad: 0.10 mL
     (10.0,         0.20),   # 5 mL + 10 mL syringe  minor grad: 0.20 mL
-    (25.0,         1.00),   # 20 mL + 25 mL syringe minor grad: 1.00 mL
-    (60.0,         2.00),   # 50 mL + 60 mL syringe minor grad: 2.00 mL
-    (float('inf'), 5.00),   # > 60 mL (bag)
+    (float('inf'), 1.00),   # 20 mL and larger      minor grad: 1.00 mL
 ]
 
 # Variance limits by drug type
