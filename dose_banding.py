@@ -40,6 +40,13 @@ import csv
 import math
 import sys
 from pathlib import Path
+
+# Algorithm version, surfaced in the web interface so that output can always be
+# traced to the code that produced it.
+#   v1.0        — base algorithm as described in the JOPP manuscript (tagged)
+#   2.0.0-dev   — current: adds Phase 2 vial optimisation, not yet tagged
+# Bump this in the same commit as the release tag.
+__version__ = "2.0.0-dev"
 from typing import Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
