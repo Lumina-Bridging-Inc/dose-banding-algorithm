@@ -29,7 +29,10 @@ DTYPE = "traditional"
 VAR = VARIANCE[DTYPE]
 MIN_DOSE = 5.0
 PAPER_MAX = 380.0     # range reported in manuscript v1.0
-FULL_MAX = 1058.30    # full extent of the embedded NHS v7 reference table
+FULL_MAX = 1058.30    # extent of the NHS v7 rows transcribed into NHS_20_REF
+PUBLISHED_MAX = 6368.68   # extent of the published NHS v7 table (rows above
+                          # FULL_MAX are not transcribed, so only the
+                          # algorithm's own properties can be checked there)
 
 REGIONS = [("< 20 mg", 0.0, 20.0),
            ("20–99 mg", 20.0, 100.0),
@@ -220,10 +223,48 @@ def out_of_sample() -> None:
     write_band_csv(rows, OUT / "out_of_sample_6mgml_algorithm_bands.csv")
 
 
+def published_extent() -> None:
+    """
+    Algorithm-only run across the full published extent of the NHS v7 table
+    (5.0–6368.68 mg). No band-by-band comparison is possible here because
+    NHS_20_REF stops at FULL_MAX, so this checks the three guaranteed
+    properties only — which is what the manuscript claims for this range.
+    """
+    rows = build_bands(cfg(PUBLISHED_MAX))
+    worst_below = max(r["variance_below_pct"] for r in rows)
+    worst_above = max(abs(r["variance_above_pct"]) for r in rows)
+    gaps = [i for i in range(len(rows) - 1)
+            if abs(float(rows[i]["to_a_mg"]) - float(rows[i + 1]["from_mg"])) > 1e-6]
+    assert not verify_bands(rows, VAR, CONC)
+
+    above = [r for r in rows if float(r["band_dose_mg"]) > FULL_MAX]
+    cyclo = [r for r in rows if 960.0 <= float(r["band_dose_mg"]) <= 2500.0]
+
+    print(f"\n{'=' * 74}\n  PUBLISHED EXTENT: algorithm only, "
+          f"{MIN_DOSE:g}–{PUBLISHED_MAX:g} mg at {CONC:g} mg/mL\n{'=' * 74}")
+    print(f"  Algorithm bands ................... {len(rows)}")
+    print(f"  Max boundary variance below/above . {worst_below:.2f}% / "
+          f"{worst_above:.2f}%  (0 exceedances)")
+    print(f"  Coverage gaps ..................... {len(gaps)}")
+    print(f"  Bands above {FULL_MAX:g} mg ............ {len(above)}  "
+          f"(first {float(above[0]['band_dose_mg']):g} mg)")
+    print(f"  Bands over the 960–2500 mg window . {len(cyclo)}  "
+          f"({float(cyclo[0]['band_dose_mg']):g}–"
+          f"{float(cyclo[-1]['band_dose_mg']):g} mg)")
+    print(f"  Largest band volume ............... "
+          f"{float(rows[-1]['volume_mL']):g} mL")
+    print("  NHS comparison .................... not possible above "
+          f"{FULL_MAX:g} mg (rows not transcribed)")
+
+    OUT.mkdir(parents=True, exist_ok=True)
+    write_band_csv(rows, OUT / "algorithm_bands_5-6368mg.csv")
+
+
 def main() -> None:
     rows_380 = report(PAPER_MAX, "5-380mg")
     table4_excerpt(rows_380)
     report(FULL_MAX, "5-1058mg")
+    published_extent()
     out_of_sample()
     print(f"\n  CSVs written to {OUT.resolve()}\n")
 
