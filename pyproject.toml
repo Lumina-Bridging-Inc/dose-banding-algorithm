@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dose-banding"
+version = "2.0.0"
+description = "Chemotherapy dose band generation with a guaranteed tolerance bound"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Sean P. Hopkins" }]
+keywords = ["dose banding", "chemotherapy", "oncology", "pharmacy", "CPOE"]
+classifiers = [
+    "Intended Audience :: Healthcare Industry",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8", "hypothesis>=6.100"]
+
+[project.urls]
+Repository = "https://github.com/Lumina-Bridging-Inc/dose-banding-algorithm"
+
+[project.scripts]
+dose-banding = "dose_banding:main"
+
+[tool.setuptools]
+py-modules = ["dose_banding"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
