@@ -63,9 +63,11 @@ from typing import Optional
 # above 60 mL. Both were wrong: 50 and 60 mL syringes are graduated at 1 mL,
 # and volumes beyond a single syringe are drawn in successive aliquots, so
 # the achievable resolution stays at 1 mL rather than coarsening. The 6 mg/mL
-# table confirms this directly — all 33 of its band doses land on whole
-# millilitres, including at 128 mL. Those two tiers had never been exercised
-# by any validation: the 20 mg/mL comparison stops at 380 mg, i.e. 19 mL.
+# table confirms this directly — all 26 of its band doses at or above 10 mL
+# land on whole millilitres, the largest at 128 mL. (The remaining 7 sit below
+# 10 mL, on the finer 0.2 and 0.1 mL graduations.) Those two tiers had never
+# been exercised by any validation: the 20 mg/mL comparison stops at 380 mg,
+# i.e. 19 mL.
 # ─────────────────────────────────────────────────────────────────────────────
 VOLUME_PRECISION_TIERS: list[tuple[float, float]] = [
     # Small syringes: BD minor graduations per Jordan et al,
@@ -116,15 +118,6 @@ def get_dose_step_mg(dose_mg: float, conc: float) -> float:
 def floor_to_step(value: float, step: float) -> float:
     """Floor to nearest multiple of step (with fp-noise guard)."""
     return math.floor(round(value / step, 9)) * step
-
-
-def ceil_to_step(value: float, step: float) -> float:
-    """Ceiling to nearest multiple of step."""
-    return math.ceil(round(value / step, 9)) * step
-
-
-def geo_mean(a: float, b: float) -> float:
-    return math.sqrt(a * b)
 
 
 def floor_to_dp(value: float, dp: int = BOUNDARY_DP) -> float:
