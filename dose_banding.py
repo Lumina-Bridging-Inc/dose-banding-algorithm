@@ -44,9 +44,10 @@ from pathlib import Path
 # Algorithm version, surfaced in the web interface so that output can always be
 # traced to the code that produced it.
 #   v1.0        — base algorithm as described in the JOPP manuscript (tagged)
-#   2.0.0-dev   — current: adds Phase 2 vial optimisation, not yet tagged
+#   2.0.0       — current: adds Phase 2 vial optimisation, corrected volume
+#                 tiers above 25 mL, and the strict tolerance guarantee (tagged)
 # Bump this in the same commit as the release tag.
-__version__ = "2.0.0-dev"
+__version__ = "2.0.0"
 from typing import Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
