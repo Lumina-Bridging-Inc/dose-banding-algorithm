@@ -55,7 +55,7 @@ Both floors are sufficient conditions, not necessary ones.
 ## Install
 
 ```bash
-pip install git+https://github.com/Lumina-Bridging-Inc/dose-banding-algorithm@v2.0.0
+pip install git+https://github.com/Lumina-Bridging-Inc/dose-banding-algorithm@v2.0.1
 ```
 
 Pure standard library — no runtime dependencies. Python 3.9+.
@@ -121,6 +121,7 @@ Run the deep profile before tagging a release.
 |---|---|
 | `v1.0` | The base algorithm as described in the manuscript. |
 | `v2.0.0` | Adds whole-vial optimisation, corrected volume tiers above 25 mL, 4 dp boundaries, and strict verification. |
+| `v2.0.1` | No change to band generation. Adds packaging and the verification suite — the earliest version that can be installed, and so pinned, as a dependency. |
 
 Band output is identical between the two when no vial sizes are supplied, so
 v2.0.0 reproduces every figure in the paper; a regression test asserts this.
