@@ -495,6 +495,9 @@ def build_bands(
             "waste_pct":               waste_pct_val,
             "waste_cost":              waste_cost_val,
             "vial_optimized":          vial_optimized,
+            # Provenance: a downloaded table is often detached from the tool
+            # that produced it, so it has to carry its own version.
+            "algorithm_version":       __version__,
         })
 
     if strict:
@@ -721,6 +724,9 @@ BAND_FIELDS = [
     "variance_below_pct", "variance_above_pct", "within_tolerance",
     # vial optimisation — empty strings for drugs without vial_sizes_mg
     "vial_combination", "waste_mg", "waste_pct", "waste_cost", "vial_optimized",
+    # provenance — deliberately NOT added to the Cerner export, which must
+    # match the standardised dose range screen field for field
+    "algorithm_version",
 ]
 
 # ── Cerner Standardized Dose Range output format ────────────────────────────
