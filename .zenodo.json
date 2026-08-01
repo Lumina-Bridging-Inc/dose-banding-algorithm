@@ -1,0 +1,21 @@
+{
+  "title": "Dose Banding Algorithm",
+  "description": "<p>Generates standardised chemotherapy dose bands with a guaranteed tolerance bound, in a format that imports directly into a CPOE standardised dose range table.</p><p>For every configuration it accepts, the generated table is verified to satisfy three properties before being returned: <em>dispensability</em> (every band dose is a whole number of syringe graduations for its own volume tier), <em>tolerance</em> (every prescribed dose in range receives a band dose within &plusmn;6% for traditional cytotoxics or &plusmn;10% for monoclonal antibodies, judged at the published boundaries), and <em>coverage</em> (the bands tile the requested range with no gap and no overlap). Where the guarantee cannot be met, the algorithm raises rather than emitting a table that breaches tolerance.</p><p>Tag <code>v1.0</code> is the state of the algorithm described in the accompanying manuscript. Later tags add whole-vial optimisation, which is outside the scope of that paper and does not alter band generation when no vial sizes are supplied.</p>",
+  "upload_type": "software",
+  "license": "MIT",
+  "access_right": "open",
+  "creators": [
+    {
+      "name": "Hopkins, Sean P."
+    }
+  ],
+  "keywords": [
+    "dose banding",
+    "chemotherapy",
+    "oncology pharmacy",
+    "CPOE",
+    "medication safety",
+    "reproducible research"
+  ],
+  "notes": "Developed without funding. Not a medical device: any generated table must be reviewed and approved by a qualified pharmacist against local policy before clinical use."
+}

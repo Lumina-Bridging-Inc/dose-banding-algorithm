@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+title: "Dose Banding Algorithm"
+message: >-
+  If you use this software, please cite both the software itself and the
+  accompanying paper.
+type: software
+authors:
+  - family-names: Hopkins
+    given-names: Sean P.
+    # orcid: "https://orcid.org/0000-0000-0000-0000"   # TODO: add before minting the DOI
+repository-code: "https://github.com/Lumina-Bridging-Inc/dose-banding-algorithm"
+abstract: >-
+  Generates standardised chemotherapy dose bands with a guaranteed tolerance
+  bound, in a format that imports directly into a CPOE standardised dose range
+  table. For every configuration it accepts, the generated table is verified to
+  satisfy three properties before being returned: every band dose is a whole
+  number of syringe graduations, every prescribed dose in range receives a band
+  dose within the stated tolerance judged at the published boundaries, and the
+  bands tile the range with no gap and no overlap. Where the guarantee cannot be
+  met the algorithm refuses rather than emitting a non-compliant table.
+keywords:
+  - dose banding
+  - chemotherapy
+  - oncology pharmacy
+  - CPOE
+  - medication safety
+license: MIT
+version: "1.0"
+# doi: 10.5281/zenodo.XXXXXXX   # TODO: add the version DOI once minted
