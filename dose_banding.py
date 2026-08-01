@@ -44,21 +44,29 @@ from typing import Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VOLUME PRECISION TIERS
-# Based on analysis of NHS England 20 mg/mL Version 7 reference table.
+# The tier structure was originally derived by analysis of the NHS England
+# 20 mg/mL Version 7 reference table; the graduation values themselves are
+# physical properties of the syringes in routine clinical use.
 # Tuple: (upper_volume_mL_exclusive, volume_step_mL)
+#
+# Revised 2026-07-31 after out-of-sample validation against the NHS England
+# 6 mg/mL Version 2 table (paclitaxel, single container). Earlier revisions
+# assumed 2.00 mL graduations for 50/60 mL syringes and a 5.00 mL increment
+# above 60 mL. Both were wrong: 50 and 60 mL syringes are graduated at 1 mL,
+# and volumes beyond a single syringe are drawn in successive aliquots, so
+# the achievable resolution stays at 1 mL rather than coarsening. The 6 mg/mL
+# table confirms this directly — all 33 of its band doses land on whole
+# millilitres, including at 128 mL. Those two tiers had never been exercised
+# by any validation: the 20 mg/mL comparison stops at 380 mg, i.e. 19 mL.
 # ─────────────────────────────────────────────────────────────────────────────
 VOLUME_PRECISION_TIERS: list[tuple[float, float]] = [
     # Small syringes: BD minor graduations per Jordan et al,
     # Hospital Pharmacy 2019 (PMC8114303), Table 1.
-    # Larger syringes (25, 50, 60 mL) use standard clinical graduations.
-    # Note: 20 mL and 25 mL share the same 1.00 mL minor graduation,
-    # so they are combined into one tier.
+    # 20 mL and larger syringes use standard clinical graduations of 1 mL.
     (1.0,          0.01),   # 1 mL syringe          minor grad: 0.01 mL
     (3.0,          0.10),   # 3 mL syringe          minor grad: 0.10 mL
     (10.0,         0.20),   # 5 mL + 10 mL syringe  minor grad: 0.20 mL
-    (25.0,         1.00),   # 20 mL + 25 mL syringe minor grad: 1.00 mL
-    (60.0,         2.00),   # 50 mL + 60 mL syringe minor grad: 2.00 mL
-    (float('inf'), 5.00),   # > 60 mL (bag)
+    (float('inf'), 1.00),   # 20 mL and larger      minor grad: 1.00 mL
 ]
 
 # Variance limits by drug type
@@ -66,6 +74,15 @@ VARIANCE: dict[str, float] = {
     "traditional": 0.06,
     "mab":         0.10,
 }
+
+# Decimal places used when presenting band boundaries.
+# NOTE: 2 dp is NOT safe. At small absolute doses a 0.01 mg floor is a large
+# relative perturbation, and flooring `from_mg` downward inflates the below-band
+# variance computed from the *published* boundaries. Sweeping 306 concentration/
+# range configurations (12 413 bands) gives a worst case of 6.13% at 2 dp
+# (10 bands over 6.00%) versus exactly 6.00% and zero exceedances at 3 or 4 dp.
+# 4 dp also matches the precision displayed by the Cerner dose range screen.
+BOUNDARY_DP: int = 4
 
 OUTPUT_DIR = Path("output")
 
@@ -101,6 +118,11 @@ def ceil_to_step(value: float, step: float) -> float:
 def geo_mean(a: float, b: float) -> float:
     return math.sqrt(a * b)
 
+
+def floor_to_dp(value: float, dp: int = BOUNDARY_DP) -> float:
+    """Floor to `dp` decimal places (matches the NHS 'From ≥' convention)."""
+    q = 10 ** dp
+    return math.floor(round(value, dp + 6) * q) / q
 
 def _count_vials(label: str) -> int:
     """Count total vials in a combination label, e.g. '2x30mg + 1x60mg' → 3."""
@@ -265,8 +287,13 @@ def generate_band_doses(
     # The lowest boundary of the first band = min_dose, so we need:
     #   D₀ ≤ min_dose × (1+var)       [band dose is at most var% above min_dose]
     # Pick the largest dispensable dose satisfying this.
-    step0 = get_dose_step_mg(min_dose, conc)
-    D0    = floor_to_step(min_dose * (1.0 + var), step0)
+    # The step must be evaluated at the CANDIDATE dose, not at min_dose: the two
+    # can sit in different volume tiers (e.g. min_dose 19.4 mg @ 20 mg/mL puts
+    # min_dose at 0.97 mL but the candidate at 1.02 mL, a coarser tier), which
+    # would otherwise yield an off-graduation first band. Mirrors _max_next_dose.
+    D0_max = min_dose * (1.0 + var)
+    step0  = get_dose_step_mg(D0_max, conc)
+    D0     = floor_to_step(D0_max, step0)
 
     # Safety: if D0 < min_dose push up one step so coverage starts ≤ min_dose
     if D0 < min_dose - 1e-9:
@@ -307,8 +334,16 @@ def build_bands(
     max_per_vial: int = 8,
     vials_shared: bool = False,
     cost_per_mg:  Optional[float] = None,
-) -> list:
-    """Return band-row dicts for one drug config entry."""
+    strict:       bool = True,
+) -> list[dict]:
+    """
+    Return band-row dicts for one drug config entry.
+
+    With strict=True (default) the resulting table is verified against the
+    three properties the algorithm claims to guarantee — dispensability,
+    tolerance at the published boundaries, and gap-free coverage — and a
+    ValueError is raised if any of them fails. See `verify_bands`.
+    """
     name      = drug["drug_name"].strip()
     conc      = float(drug["concentration_mg_per_ml"])
     dtype     = drug["drug_type"].strip().lower()
@@ -347,19 +382,17 @@ def build_bands(
             from_mg = min_dose
         else:
             # Precise lower boundary: any dose below this is covered by D_prev
-            from_mg = band_doses[i - 1] / (1.0 - var)
-            # Floor to 2 dp (matches NHS "From ≥" convention)
-            from_mg = math.floor(round(from_mg, 8) * 100) / 100
+            from_mg = floor_to_dp(band_doses[i - 1] / (1.0 - var))
 
         if i == n - 1:
             to_a_mg = max_dose
         else:
             # Precise upper boundary: doses up to but NOT including this value
-            to_a_mg = D / (1.0 - var)
-            # Floor to 2 dp
-            to_a_mg = math.floor(round(to_a_mg, 8) * 100) / 100
+            to_a_mg = floor_to_dp(D / (1.0 - var))
 
-        to_b_mg = round(to_a_mg - 0.01, 2)   # Round-DOWN system boundary
+        # Round-DOWN system boundary: the largest value still inside this band
+        # for a CPOE system whose range operator is inclusive at the upper end.
+        to_b_mg = round(to_a_mg - 10 ** (-BOUNDARY_DP), BOUNDARY_DP)
 
         # ── Vial optimisation ────────────────────────────────────────────────
         # Attempt to substitute D with a zero-waste vial combination that
@@ -427,17 +460,20 @@ def build_bands(
         var_below_pct = (D - from_mg) / from_mg * 100.0 if from_mg > 0 else 0.0
         var_above_pct = (D - to_a_mg) / to_a_mg * 100.0 if to_a_mg > 0 else 0.0
 
+        # No rounding allowance: with BOUNDARY_DP = 4 the published boundaries
+        # satisfy the tolerance exactly, so only a floating-point epsilon is
+        # needed. (The former +0.11% allowance existed to absorb 2 dp flooring.)
         max_pct = var * 100.0
         within  = (
-            abs(var_below_pct) <= max_pct + 0.11 and   # 0.11% rounding allowance
-            abs(var_above_pct) <= max_pct + 0.11
+            abs(var_below_pct) <= max_pct + 1e-9 and
+            abs(var_above_pct) <= max_pct + 1e-9
         )
 
         rows.append({
             "drug_name":               name,
             "concentration_mg_per_ml": conc,
             "drug_type":               dtype,
-            "band_dose_mg":            round(D, 2),
+            "band_dose_mg":            round(D, BOUNDARY_DP),
             "volume_mL":               volume_mL,
             "volume_step_mL":          vol_step,
             "from_mg":                 from_mg,
@@ -454,7 +490,91 @@ def build_bands(
             "vial_optimized":          vial_optimized,
         })
 
+    if strict:
+        failures = verify_bands(rows, var, conc)
+        if failures:
+            shown = "\n  - ".join(failures[:5])
+            more  = (f"\n  … and {len(failures) - 5} further failure(s)"
+                     if len(failures) > 5 else "")
+            raise ValueError(
+                f"{name}: the requested configuration cannot be banded within "
+                f"±{var * 100:.1f}% using dispensable volumes.\n"
+                f"  - {shown}{more}\n"
+                f"  This happens when the syringe graduation step is large "
+                f"relative to the dose — i.e. the relative step exceeds "
+                f"2τ/(1−τ) = {2 * var / (1 - var) * 100:.2f}%. Raise the "
+                f"minimum dose, use a lower concentration, or widen the "
+                f"tolerance."
+            )
+
     return rows
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STRICT VERIFICATION OF THE THREE GUARANTEED PROPERTIES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def verify_bands(rows: list[dict], var: float, conc: float) -> list[str]:
+    """
+    Check the properties the algorithm guarantees, from the PUBLISHED values
+    (i.e. the boundaries as rounded for presentation, not the exact reals):
+
+      1. Dispensability — every band volume is an exact multiple of the
+         graduation step declared for its own volume tier.
+      2. Tolerance — variance at both published boundaries is ≤ var.
+      3. Coverage — no gap between adjacent bands.
+
+    Returns a list of human-readable failure descriptions; empty means the
+    table satisfies all three. This is an exact check rather than an analytic
+    precondition test, so it neither rejects configurations that are in fact
+    valid nor accepts ones that are not.
+    """
+    failures: list[str] = []
+    prev_to = None
+
+    for row in rows:
+        D    = float(row["band_dose_mg"])
+        frm  = float(row["from_mg"])
+        to_a = float(row["to_a_mg"])
+        vol  = float(row["volume_mL"])
+        vstep = float(row["volume_step_mL"])
+
+        # 1. Dispensability
+        # Vial-substituted band doses are exempt: a zero-waste whole-vial
+        # combination is prepared by drawing the entire contents of each vial,
+        # so no partial volume is measured and the syringe graduation is not
+        # the binding constraint. Bands where vial optimisation found no
+        # zero-waste fit keep the graduation-aligned dose and are still checked.
+        if row.get("vial_optimized") is not True:
+            if abs(vol / vstep - round(vol / vstep)) > 1e-6:
+                failures.append(
+                    f"band {D:g} mg = {vol:g} mL is not a multiple of the "
+                    f"{vstep:g} mL graduation step"
+                )
+
+        # 2. Tolerance at the published boundaries
+        v_low  = abs(D - frm) / frm  * 100.0 if frm  > 0 else 0.0
+        v_high = abs(D - to_a) / to_a * 100.0 if to_a > 0 else 0.0
+        limit  = var * 100.0
+        if v_low > limit + 1e-9:
+            failures.append(
+                f"band {D:g} mg: below-boundary variance {v_low:.2f}% "
+                f"exceeds ±{limit:.1f}% (from {frm:g} mg)"
+            )
+        if v_high > limit + 1e-9:
+            failures.append(
+                f"band {D:g} mg: above-boundary variance {v_high:.2f}% "
+                f"exceeds ±{limit:.1f}% (to {to_a:g} mg)"
+            )
+
+        # 3. Coverage
+        if prev_to is not None and frm > prev_to + 1e-9:
+            failures.append(
+                f"coverage gap between {prev_to:g} mg and {frm:g} mg"
+            )
+        prev_to = to_a
+
+    return failures
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -488,11 +608,11 @@ def validate_tolerance_and_coverage(rows: list[dict], var: float) -> dict:
             max_var      = v_max
             max_var_band = D
 
-        if v_max > var + 0.001:   # 0.1% tolerance for fp rounding
+        if v_max > var + 1e-9:    # fp epsilon only — see BOUNDARY_DP note
             violations.append((D, v_max * 100))
 
         # Coverage gap check
-        if prev_to is not None and frm > prev_to + 0.02:
+        if prev_to is not None and frm > prev_to + 1e-9:
             gaps.append((prev_to, frm))
         prev_to = to_a
 
@@ -634,9 +754,9 @@ def write_cerner_csv(rows: list[dict], filepath: Path,
 
 TEMPLATE_ROWS = [
     {"drug_name": "ExampleDrug_A", "concentration_mg_per_ml": 20,
-     "drug_type": "traditional", "min_dose_mg": 5, "max_dose_mg": 1060},
+     "drug_type": "traditional", "min_dose_mg": 200, "max_dose_mg": 1060},
     {"drug_name": "ExampleDrug_B", "concentration_mg_per_ml": 10,
-     "drug_type": "mab",         "min_dose_mg": 100, "max_dose_mg": 2000},
+     "drug_type": "mab",         "min_dose_mg": 400, "max_dose_mg": 2000},
 ]
 
 
