@@ -54,8 +54,14 @@ Both floors are sufficient conditions, not necessary ones.
 
 ## Install
 
+If you have come from the paper and want to check its numbers, you do not need
+this section — skip to [Reproducing the published
+results](#reproducing-the-published-results), which needs no install at all.
+
+To use the algorithm as a dependency:
+
 ```bash
-pip install git+https://github.com/Lumina-Bridging-Inc/dose-banding-algorithm@v2.0.1
+pip install git+https://github.com/Lumina-Bridging-Inc/dose-banding-algorithm@v2.1.1
 ```
 
 Pure standard library — no runtime dependencies. Python 3.9+.
@@ -127,18 +133,71 @@ dose-banding drugs_input.csv --validate   # + NHS reference cross-check
 
 ## Reproducing the published results
 
+This is the reproducibility artefact for the manuscript: clone, run one
+command, obtain every published number. Nothing needs to be installed and no
+Python knowledge is required — the algorithm uses only the standard library,
+and the whole run takes about two seconds.
+
+**1. Check for Python 3.9 or later.** In a terminal (Terminal on macOS,
+PowerShell on Windows):
+
 ```bash
-python validate_paper.py
+python3 --version
 ```
 
-Regenerates every table reported in the manuscript and prints the figures
-quoted in the text, writing CSVs to `output/paper/`. This is the
-reproducibility artefact: clone, run one command, obtain every published
-number.
+If that reports anything below 3.9, or `command not found`, install Python from
+[python.org/downloads](https://www.python.org/downloads/) — there are macOS and
+Windows installers; on Linux use your distribution's package manager. On
+Windows, type `python` wherever this section says `python3`.
+
+**2. Get the code and run it.**
+
+```bash
+git clone https://github.com/Lumina-Bridging-Inc/dose-banding-algorithm
+cd dose-banding-algorithm
+python3 validate_paper.py
+```
+
+Without `git`, download the repository from its GitHub page instead — the green
+**Code** button, then **Download ZIP** — unpack it, `cd` into the unpacked
+folder, and run the third command there.
+
+**3. Check it worked.** The output opens with the paper's headline table:
+
+```
+  5-380mg: 5–380 mg @ 20 mg/mL, ±6%
+==========================================================================
+  Algorithm bands ............ 44
+  Max boundary variance ...... 6.00%   (limit ±6%)
+  Bands exceeding limit ...... 0
+  Coverage gaps .............. 0
+  All volumes on-graduation .. yes
+```
+
+What follows regenerates each remaining table in turn — the band-by-band
+comparison against the NHS 20 mg/mL reference, the reference bands that exceed
+±6%, the Cerner CPOE excerpt, the comparison across the reference table's full
+published extent, and the out-of-sample 6 mg/mL validation. Every figure quoted
+in the manuscript appears in that output, and the tables behind it are written
+as CSVs to `output/paper/`.
+
+### Which version to run
+
+Run `main`, as above. The manuscript describes the algorithm as tagged `v1.0`,
+and band generation is unchanged since — the later releases add whole-vial
+optimisation, which is inert when no vial sizes are supplied, and a regression
+test asserts the outputs are identical. But the validation script itself has
+grown: `v1.0` predates the comparison across the reference table's full
+published extent, so checking out that tag reproduces most of the paper's
+figures and not all of them.
 
 ## Tests
 
+Unlike the validation script, the tests do need two libraries installed, so
+work in a virtual environment to keep them out of your system Python:
+
 ```bash
+python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[test]"
 pytest                              # fast, ~250 examples per property
 pytest --hypothesis-profile=deep    # 5000 examples per property
