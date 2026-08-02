@@ -31,6 +31,7 @@ from dose_banding import (
     enumerate_vial_combinations,
     BOUNDARY_DP,
     VARIANCE,
+    _max_next_dose,
     build_bands,
     generate_band_doses,
     get_dose_step_mg,
@@ -514,20 +515,65 @@ def test_vial_aware_band_doses_are_vial_exact_or_dispensable(cfg, vials):
         )
 
 
+# There is deliberately NO property here asserting that vial-aware placement
+# beats the greedy table on waste. It does not, and no bound on how much worse
+# it can be survived the deep profile either — 5 mg/mL mab over 40-80 mg on
+# 10/50/200 mg vials gives 17 mg against the greedy 6 mg. Placement moves the
+# bands; substitution keeps them and fits vials in afterwards. Neither
+# dominates, so the comparison belongs to the caller, and the non-domination
+# is pinned with its witnesses in test_regressions.py.
+
+
 @SETTINGS
 @given(cfg=well_posed_config(), vials=st.sampled_from(VIAL_SETS))
-def test_vial_aware_never_produces_a_worse_waste_total(cfg, vials):
+def test_every_band_dose_sits_inside_its_own_range(cfg, vials):
     """
-    Placement exists to reduce waste. It is allowed to spend bands doing so,
-    but it must never come out behind the greedy table on the metric it is
-    optimising — that would mean the extra bands bought nothing.
-    """
-    def total_waste(rows):
-        return sum(float(str(r["waste_mg"]).lstrip("~") or 0) for r in rows)
+    A band dose below the range it serves is compliant but incoherent: under
+    placement the band is then only as wide as the leftover, and the table
+    carries two near-identical doses.
 
+    Asserted for the doses placement actually chooses — the zero-waste vial
+    totals. Two other routes to the same shape exist and are NOT covered here,
+    both pinned with witnesses in test_regressions.py:
+
+      * Phase 2 substitution searches from `to_a_mg*(1-tau)`, below `from_mg`,
+        so the greedy table can seat a substituted dose under its range. Milder:
+        the boundaries are already fixed, so the band is not narrowed.
+      * The shared `_max_next_dose` fallback floors to the graduation step, and
+        at a volume-tier crossing that floor can land below `from_mg`. This one
+        predates vial optimisation entirely and reaches the vial-free algorithm
+        the manuscript describes — though it needs a range that straddles a tier
+        edge at fine resolution, and none of 32 ordinary clinical configurations
+        triggered it.
+
+    Correcting either would change published output, so they are decisions
+    rather than defects, and are recorded rather than silently fixed.
+
+    Bands are skipped where the graduation makes the invariant unachievable.
+    At a volume-tier crossing the step can be coarser than the whole window
+    [band_low, cap], so no dispensable dose exists inside the band at all —
+    1 mg/mL over 7.5-15 mg is the witness, where the window [10.2128, 10.8255]
+    contains no multiple of the 1 mg step. There the only alternatives are a
+    dose fractionally under its range or refusing the configuration outright,
+    and the algorithm reasonably takes the former. `_max_next_dose` landing
+    below `band_low` is exactly that condition, so it is the skip test.
+    """
+    conc = cfg["concentration_mg_per_ml"]
+    tau = VARIANCE[cfg["drug_type"]]
     try:
-        greedy = build_bands(cfg, vial_sizes=vials, strict=True)
-        aware = build_bands(cfg, vial_sizes=vials, strict=True, vial_aware=True)
+        rows = build_bands(cfg, vial_sizes=vials, strict=True, vial_aware=True)
     except ValueError:
         return
-    assert total_waste(aware) <= total_waste(greedy) + 1e-6
+
+    for previous, row in zip(rows, rows[1:]):
+        D_prev = float(previous["band_dose_mg"])
+        band_low = D_prev / (1.0 - tau)
+        if _max_next_dose(D_prev, tau, conc) < band_low - 1e-9:
+            continue  # no dispensable dose exists inside this band
+
+        D = float(row["band_dose_mg"])
+        from_mg = float(row["from_mg"])
+        assert D >= from_mg - 1e-9, (
+            f"band {D} mg below its range {from_mg} "
+            f"(conc={conc}, vials={vials})"
+        )

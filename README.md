@@ -94,11 +94,23 @@ rounding. A vial total just below the band dose is unreachable — with
 rows = build_bands(drug, vial_sizes=[10.0, 50.0, 200.0], vial_aware=True)
 ```
 
-For epirubicin 2 mg/mL over 50–260 mg that is 17 of 20 bands zero-waste
-(10 mg total waste) against 6 of 15 (56 mg) — including a 200 mg band drawn
-from one vial. The cost is table size: a vial total below the widest
-admissible dose narrows the band, so more bands are needed. Callers who want
-the minimum-band table (P4) should leave the flag off.
+For epirubicin 2 mg/mL over 50–260 mg that is 16 of 19 bands zero-waste
+(14 mg total waste) against 6 of 15 (56 mg) — including a 200 mg band drawn
+from one vial and a 150 mg band from three 50s, neither of which substitution
+can reach. The cost is table size: a vial total below the widest admissible
+dose narrows the band, so more bands are needed. Callers who want the
+minimum-band table (P4) should leave the flag off.
+
+**It is not guaranteed to beat the default on waste.** Placement moves the
+bands; substitution keeps them and fits vials in afterwards. Neither dominates.
+Across 336 clinical configurations placement was worse on total waste in 1 and
+worse on zero-waste count in 13 — so present both figures to the user rather
+than assuming the flag is an improvement.
+
+A placed band dose always sits inside its own band. Allowing one beneath its
+range is admissible on tolerance alone but produces a band only as wide as the
+leftover: 2.1.0 emitted a 2 mg-wide band at 80 mg directly after one at 78 mg.
+Corrected in 2.1.1.
 
 It is opt-in because it changes published output, and it is suppressed when
 `vials_shared=True` — pooling recovers the residual for another patient, so
@@ -148,6 +160,7 @@ Run the deep profile before tagging a release.
 | `v2.0.0` | Adds whole-vial optimisation, corrected volume tiers above 25 mL, 4 dp boundaries, and strict verification. |
 | `v2.0.1` | No change to band generation. Adds packaging and the verification suite — the earliest version that can be installed, and so pinned, as a dependency. |
 | `v2.1.0` | Adds opt-in `vial_aware` band placement. Default output is unchanged; `waste_cost` now carries the same `~` indicative marker as `waste_mg` when vials are pooled. |
+| `v2.1.1` | `vial_aware` placement now requires each band dose to sit inside its own band. Fixes near-duplicate bands (78 and 80 mg on epirubicin). Affects `vial_aware=True` output only. |
 
 Band output is identical between the two when no vial sizes are supplied, so
 v2.0.0 reproduces every figure in the paper; a regression test asserts this.

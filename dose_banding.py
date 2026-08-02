@@ -50,12 +50,16 @@ from pathlib import Path
 #                 algorithm as an installable package, with the property-based
 #                 verification suite. This is the earliest version a dependant
 #                 can pin, since 2.0.0 predates the packaging metadata.
-#   2.1.0       — current: adds opt-in vial-aware band placement
+#   2.1.0       — adds opt-in vial-aware band placement
 #                 (`build_bands(..., vial_aware=True)`). Default is off, so
 #                 2.0.1 output is reproduced byte for byte unless the caller
 #                 asks for the new behaviour.
+#   2.1.1       — current: vial-aware placement now requires a band dose to sit
+#                 inside its own band. 2.1.0 could seat one beneath its range,
+#                 producing a 2 mg-wide band next to a near-identical one.
+#                 Changes vial_aware=True output only; the default is untouched.
 # Bump this in the same commit as the release tag.
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 from typing import Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -395,22 +399,9 @@ def generate_band_doses_vial_aware(
     Args:
         vial_doses: sorted, deduplicated achievable vial-combination totals.
     """
-    def largest_vial_dose_in(
-        low: float, high: float, *, exclusive_low: bool = False,
-    ) -> Optional[float]:
-        """
-        Largest vial total in [low, high], or None.
-
-        exclusive_low matters when advancing: `low` is then the previous band
-        dose, which is itself a vial total whenever the last step succeeded.
-        Admitting it would stall the walk, and the "must strictly advance"
-        guard below would rescue it by adding one graduation step — quietly
-        turning a zero-waste band into a wasteful one.
-        """
-        if exclusive_low:
-            found = [d for d in vial_doses if low + 1e-9 < d <= high + 1e-9]
-        else:
-            found = [d for d in vial_doses if low - 1e-9 <= d <= high + 1e-9]
+    def largest_vial_dose_in(low: float, high: float) -> Optional[float]:
+        """Largest vial total in [low, high], or None."""
+        found = [d for d in vial_doses if low - 1e-9 <= d <= high + 1e-9]
         return max(found) if found else None
 
     # ── First band dose ───────────────────────────────────────────────────────
@@ -433,9 +424,21 @@ def generate_band_doses_vial_aware(
         D_prev = band_doses[-1]
 
         # Gap-free coverage bounds the advance exactly as in the greedy case:
-        # D_next/(1+var) <= D_prev/(1-var). Anything in (D_prev, cap] is valid.
-        cap    = D_prev * (1.0 + var) / (1.0 - var)
-        D_next = largest_vial_dose_in(D_prev, cap, exclusive_low=True)
+        # D_next/(1+var) <= D_prev/(1-var), so D_next <= cap.
+        cap = D_prev * (1.0 + var) / (1.0 - var)
+
+        # The next band's own lower boundary. A vial total below this is
+        # admissible on tolerance alone — it still serves every dose in the
+        # band to within var% — but it produces a band whose dose sits beneath
+        # its own range, and the band is then only as wide as the gap between
+        # the vial total and the boundary. With 10/50/200 mg vials that gave a
+        # 2 mg-wide band at 80 mg immediately after one at 78 mg: two bands a
+        # pharmacist cannot tell apart, which is the opposite of what banding
+        # is for. Requiring the dose to sit inside its own band costs the odd
+        # zero-waste opportunity and buys a table that reads sensibly.
+        band_low = D_prev / (1.0 - var)
+
+        D_next = largest_vial_dose_in(band_low, cap)
 
         if D_next is None:
             D_next = _max_next_dose(D_prev, var, conc)
@@ -509,7 +512,9 @@ def build_bands(
             vial_sizes, ceiling, max_per_vial
         )
 
-    if vial_aware_applies(vial_sizes, vial_aware, vials_shared):
+    placing_on_vials = vial_aware_applies(vial_sizes, vial_aware, vials_shared)
+
+    if placing_on_vials:
         band_doses = generate_band_doses_vial_aware(
             min_dose, max_dose, conc, var,
             sorted({dose for dose, _ in vial_combos}),
@@ -578,6 +583,17 @@ def build_bands(
             #   D <= from_mg * (1 + var)   (avoid overdose at lower boundary)
             tol_low  = to_a_mg * (1.0 - var)
             tol_high = from_mg * (1.0 + var)
+
+            # Substitution runs after placement, so without this it can undo
+            # placement's guarantee: tol_low sits below from_mg, so a vial
+            # total beneath the band's own lower boundary is admissible on
+            # tolerance and would be substituted in, reseating the dose under
+            # its range. Only applied when placing — raising tol_low in the
+            # greedy path would change published v2.0.1 output for every vial
+            # user, which is a decision and not a fix.
+            if placing_on_vials:
+                tol_low = max(tol_low, from_mg)
+
             result = best_vial_dose_in_window(tol_low, tol_high, vial_combos)
             if result is not None:
                 v_dose, v_label, v_waste, v_waste_pct = result

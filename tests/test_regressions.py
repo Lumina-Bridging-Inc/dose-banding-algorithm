@@ -491,3 +491,139 @@ def test_packaged_version_matches_the_module_version():
     assert declared == dose_banding.__version__, (
         f"pyproject says {declared}, module says {dose_banding.__version__}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CORRECTION 4 — vial-aware placement produced bands beneath their own range
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_a_band_dose_is_never_below_its_own_range():
+    """
+    The walk originally accepted any vial total above the previous band dose.
+    A total only slightly above it is admissible on tolerance alone, but the
+    resulting band starts at D_prev/(1-tau) — above the dose itself — so the
+    band is only as wide as the leftover, and the dose sits beneath the range
+    it serves.
+
+    Epirubicin on 10/50/200 mg vials produced a 2.13 mg-wide band at 80 mg
+    directly after one at 78 mg: two bands no pharmacist could tell apart,
+    which defeats the purpose of banding.
+    """
+    conc, lo, hi = EPIRUBICIN
+    cfg = traditional(conc, lo, hi, "Epirubicin")
+
+    for kwargs in ({}, {"vial_aware": True}):
+        rows = build_bands(cfg, vial_sizes=EPI_VIALS, strict=True, **kwargs)
+        for row in rows:
+            D = float(row["band_dose_mg"])
+            from_mg = float(row["from_mg"])
+            assert D >= from_mg - 1e-9, (
+                f"band {D} mg sits below its own range "
+                f"{from_mg}-{row['to_a_mg']} (mode={kwargs or 'greedy'})"
+            )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Known, unfixed: Phase 2 substitution searches from to_a_mg*(1-tau), "
+           "which is below from_mg, so it can seat a band dose beneath its own "
+           "range. Milder than the placement case — the boundaries are already "
+           "fixed, so the band is not narrowed — but correcting it would change "
+           "published v2.0.1 output for every vial user, so it is a decision "
+           "rather than a bug fix. Remove this marker when that decision is made.",
+)
+def test_greedy_substitution_can_also_seat_a_dose_below_its_range():
+    """
+    Found by the property suite, not by hand: 1 mg/mL mab over 0.75-101.25 mg
+    with a single 100 mg vial puts a 100 mg dose in a band starting at
+    101.1111 mg. Recorded with its witness so the behaviour is not rediscovered
+    from scratch, and so the suite tells us the day it changes.
+    """
+    cfg = {
+        "drug_name": "Witness", "concentration_mg_per_ml": 1.0,
+        "drug_type": "mab", "min_dose_mg": 0.75, "max_dose_mg": 101.25,
+    }
+    rows = build_bands(cfg, vial_sizes=[100.0], strict=True)
+
+    for row in rows:
+        assert float(row["band_dose_mg"]) >= float(row["from_mg"]) - 1e-9, (
+            f"band {row['band_dose_mg']} mg below its range {row['from_mg']}"
+        )
+
+
+def test_the_near_duplicate_band_pair_is_gone():
+    """The specific witness, pinned so the correction cannot silently regress."""
+    conc, lo, hi = EPIRUBICIN
+    rows = build_bands(traditional(conc, lo, hi), vial_sizes=EPI_VIALS,
+                       strict=True, vial_aware=True)
+    doses = [float(r["band_dose_mg"]) for r in rows]
+
+    assert not (78.0 in doses and 80.0 in doses), (
+        f"78 and 80 mg both present again: {doses}"
+    )
+    # The 3x50mg zero-waste band is what the mode exists for; keep it.
+    assert 150.0 in doses
+    combo_150 = [r for r in rows if float(r["band_dose_mg"]) == 150.0][0]
+    assert combo_150["vial_combination"] == "3x50mg"
+    assert float(combo_150["waste_mg"]) == 0.0
+
+
+def test_no_two_bands_are_closer_than_a_useful_distance():
+    """
+    Consecutive band doses must differ by more than a rounding artefact.
+    Bands separated by a couple of milligrams are a transcription hazard on a
+    worksheet and give no clinical benefit over a single wider band.
+    """
+    conc, lo, hi = EPIRUBICIN
+    rows = build_bands(traditional(conc, lo, hi), vial_sizes=EPI_VIALS,
+                       strict=True, vial_aware=True)
+    doses = [float(r["band_dose_mg"]) for r in rows]
+
+    for lower, upper in zip(doses, doses[1:]):
+        # Each band must at least span its own predecessor's tolerance reach.
+        assert upper >= lower / (1 - TAU) - 1e-9, (
+            f"bands {lower} and {upper} mg are closer than one tolerance step"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PLACEMENT DOES NOT DOMINATE SUBSTITUTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize(
+    "conc,drug_type,lo,hi,vials",
+    [
+        (50.0, "mab", 75.0, 675.0, [100.0]),           # 440 mg vs greedy 400 mg
+        (5.0,  "mab", 40.0,  80.0, [10.0, 50.0, 200.0]),   # 17 mg vs greedy 6 mg
+    ],
+)
+def test_placement_can_waste_more_than_substitution(conc, drug_type, lo, hi, vials):
+    """
+    Both witnesses found by the property suite, not by hand.
+
+    The two mechanisms are genuinely different — placement moves the bands,
+    substitution keeps them and fits vials in afterwards — and neither wins
+    everywhere. This matters beyond the algorithm: a front-end must not
+    describe `vial_aware` as "least waste", and should show both figures so
+    the choice is made on the numbers.
+
+    If this test ever fails, placement has improved. That is good news, but
+    the README claim and the app's comparison copy both need revisiting, so
+    the suite should say so rather than let it pass unnoticed.
+    """
+    cfg = {
+        "drug_name": "Witness", "concentration_mg_per_ml": conc,
+        "drug_type": drug_type, "min_dose_mg": lo, "max_dose_mg": hi,
+    }
+
+    def waste(rows):
+        return sum(float(str(r["waste_mg"]).lstrip("~") or 0) for r in rows)
+
+    greedy = build_bands(cfg, vial_sizes=vials, strict=True)
+    aware = build_bands(cfg, vial_sizes=vials, strict=True, vial_aware=True)
+
+    assert waste(aware) > waste(greedy), (
+        f"placement now matches or beats substitution here "
+        f"({waste(aware)} vs {waste(greedy)} mg) — update the README and the "
+        f"front-end copy, then retire this test"
+    )
