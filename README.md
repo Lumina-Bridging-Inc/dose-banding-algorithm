@@ -80,6 +80,31 @@ Optionally pass `vial_sizes=[100.0, 160.0]` to substitute whole-vial
 combinations where one fits inside the band's tolerance window. The boundaries
 are not moved to accommodate a vial.
 
+### Vial-aware band placement
+
+Substitution alone is weak, because it runs after the band positions are
+fixed. Since `to_a_mg = D/(1-τ)`, the window it searches starts at `D` itself,
+so it can only ever move a band dose *up*, into a sliver left over from
+rounding. A vial total just below the band dose is unreachable — with
+10/50/200 mg vials the 202 mg band cannot take the single 200 mg vial.
+
+`vial_aware=True` places the bands on whole-vial totals instead:
+
+```python
+rows = build_bands(drug, vial_sizes=[10.0, 50.0, 200.0], vial_aware=True)
+```
+
+For epirubicin 2 mg/mL over 50–260 mg that is 17 of 20 bands zero-waste
+(10 mg total waste) against 6 of 15 (56 mg) — including a 200 mg band drawn
+from one vial. The cost is table size: a vial total below the widest
+admissible dose narrows the band, so more bands are needed. Callers who want
+the minimum-band table (P4) should leave the flag off.
+
+It is opt-in because it changes published output, and it is suppressed when
+`vials_shared=True` — pooling recovers the residual for another patient, so
+the saving is notional while the extra bands are real. Call
+`vial_aware_applies()` to report the override to a user.
+
 As a command line tool:
 
 ```bash
@@ -122,6 +147,7 @@ Run the deep profile before tagging a release.
 | `v1.0` | The base algorithm as described in the manuscript. |
 | `v2.0.0` | Adds whole-vial optimisation, corrected volume tiers above 25 mL, 4 dp boundaries, and strict verification. |
 | `v2.0.1` | No change to band generation. Adds packaging and the verification suite — the earliest version that can be installed, and so pinned, as a dependency. |
+| `v2.1.0` | Adds opt-in `vial_aware` band placement. Default output is unchanged; `waste_cost` now carries the same `~` indicative marker as `waste_mg` when vials are pooled. |
 
 Band output is identical between the two when no vial sizes are supplied, so
 v2.0.0 reproduces every figure in the paper; a regression test asserts this.

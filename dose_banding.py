@@ -46,12 +46,16 @@ from pathlib import Path
 #   v1.0        — base algorithm as described in the JOPP manuscript (tagged)
 #   2.0.0       — adds Phase 2 vial optimisation, corrected volume tiers above
 #                 25 mL, and the strict tolerance guarantee (tagged)
-#   2.0.1       — current: no change to band generation. First release of the
+#   2.0.1       — no change to band generation. First release of the
 #                 algorithm as an installable package, with the property-based
 #                 verification suite. This is the earliest version a dependant
 #                 can pin, since 2.0.0 predates the packaging metadata.
+#   2.1.0       — current: adds opt-in vial-aware band placement
+#                 (`build_bands(..., vial_aware=True)`). Default is off, so
+#                 2.0.1 output is reproduced byte for byte unless the caller
+#                 asks for the new behaviour.
 # Bump this in the same commit as the release tag.
-__version__ = "2.0.1"
+__version__ = "2.1.0"
 from typing import Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -176,6 +180,27 @@ def parse_vials_shared(raw: str) -> bool:
     Accepts 'yes' / 'no' (case-insensitive). Defaults to False.
     """
     return str(raw).strip().lower() in ("yes", "true", "1")
+
+
+def vial_aware_applies(
+    vial_sizes:   Optional[list],
+    vial_aware:   bool,
+    vials_shared: bool,
+) -> bool:
+    """
+    Whether vial-aware band placement will actually engage.
+
+    It needs vial sizes to place bands on, and it is suppressed when vials are
+    shared. Under pooling the residual volume is recovered for another patient
+    on the same day, so the drug that zero-waste placement "saves" would mostly
+    have been used anyway — the saving is notional, while the extra bands it
+    costs are real. A site that pools is better served by the minimum-band
+    greedy table.
+
+    Exposed so that a front-end can tell the user the flag was overridden
+    rather than re-deriving the rule and drifting out of step with it.
+    """
+    return bool(vial_sizes) and vial_aware and not vials_shared
 
 
 def enumerate_vial_combinations(
@@ -329,6 +354,108 @@ def generate_band_doses(
     return band_doses
 
 
+def generate_band_doses_vial_aware(
+    min_dose:   float,
+    max_dose:   float,
+    conc:       float,
+    var:        float,
+    vial_doses: list[float],
+) -> list[float]:
+    """
+    As `generate_band_doses`, but PLACES bands on whole-vial totals wherever
+    one is admissible, instead of maximising each band's width.
+
+    Why this exists
+    ---------------
+    Phase 2 (`best_vial_dose_in_window`) substitutes a vial total into a window
+    that `generate_band_doses` has already fixed. Those two steps interact
+    badly. Because `to_a_mg = D/(1-var)`, the window's lower bound
+    `to_a_mg*(1-var)` collapses to D itself, so the substitution can only ever
+    move a band dose UP, into a sliver whose width is the leftover from
+    `floor_to_step` — often under 1 mg. A vial total sitting just BELOW the
+    greedy dose is unreachable no matter how attractive it is: with 10/50/200 mg
+    vials the 202 mg band cannot take the single 200 mg vial, because 200 < 202.
+
+    Placing the bands first removes that ordering problem: the width sacrificed
+    by choosing a vial total over the widest admissible dose is exactly what
+    buys the zero-waste preparation.
+
+    The cost is band count. A vial total below the maximum advance narrows the
+    band, so more bands are needed to cover the range. Callers who want the
+    minimum-band table (P4) should keep using `generate_band_doses`.
+
+    Dispensability
+    --------------
+    A vial-exact band dose is exempt from the graduation grid, on the same
+    rationale `verify_bands` already applies to substituted bands: a zero-waste
+    total is prepared by drawing each vial entire, so no partial volume is
+    measured. Fallback doses — steps where no vial total is admissible — are
+    graduation-aligned as usual.
+
+    Args:
+        vial_doses: sorted, deduplicated achievable vial-combination totals.
+    """
+    def largest_vial_dose_in(
+        low: float, high: float, *, exclusive_low: bool = False,
+    ) -> Optional[float]:
+        """
+        Largest vial total in [low, high], or None.
+
+        exclusive_low matters when advancing: `low` is then the previous band
+        dose, which is itself a vial total whenever the last step succeeded.
+        Admitting it would stall the walk, and the "must strictly advance"
+        guard below would rescue it by adding one graduation step — quietly
+        turning a zero-waste band into a wasteful one.
+        """
+        if exclusive_low:
+            found = [d for d in vial_doses if low + 1e-9 < d <= high + 1e-9]
+        else:
+            found = [d for d in vial_doses if low - 1e-9 <= d <= high + 1e-9]
+        return max(found) if found else None
+
+    # ── First band dose ───────────────────────────────────────────────────────
+    # Same admissible interval as the greedy opening: [min_dose, min_dose*(1+var)].
+    # It is only var% wide — half the room later steps get — so a vial total
+    # lands here far less often than it does mid-table.
+    D0_max = min_dose * (1.0 + var)
+    D0     = largest_vial_dose_in(min_dose, D0_max)
+
+    if D0 is None:
+        step0 = get_dose_step_mg(D0_max, conc)
+        D0    = floor_to_step(D0_max, step0)
+        if D0 < min_dose - 1e-9:
+            D0 += step0
+
+    band_doses: list[float] = [round(D0, 10)]
+
+    # ── Subsequent band doses ─────────────────────────────────────────────────
+    while True:
+        D_prev = band_doses[-1]
+
+        # Gap-free coverage bounds the advance exactly as in the greedy case:
+        # D_next/(1+var) <= D_prev/(1-var). Anything in (D_prev, cap] is valid.
+        cap    = D_prev * (1.0 + var) / (1.0 - var)
+        D_next = largest_vial_dose_in(D_prev, cap, exclusive_low=True)
+
+        if D_next is None:
+            D_next = _max_next_dose(D_prev, var, conc)
+
+        # Must strictly advance by at least one dose step
+        if D_next <= D_prev + 1e-9:
+            D_next = D_prev + get_dose_step_mg(D_prev, conc)
+
+        band_doses.append(round(D_next, 10))
+
+        if D_next / (1.0 - var) >= max_dose:
+            break
+
+        if len(band_doses) > 100_000:
+            print("WARNING: exceeded 100 000 band limit. Stopping.", file=sys.stderr)
+            break
+
+    return band_doses
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BUILD FULL BAND TABLE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -340,6 +467,7 @@ def build_bands(
     vials_shared: bool = False,
     cost_per_mg:  Optional[float] = None,
     strict:       bool = True,
+    vial_aware:   bool = False,
 ) -> list[dict]:
     """
     Return band-row dicts for one drug config entry.
@@ -348,6 +476,15 @@ def build_bands(
     three properties the algorithm claims to guarantee — dispensability,
     tolerance at the published boundaries, and gap-free coverage — and a
     ValueError is raised if any of them fails. See `verify_bands`.
+
+    With vial_aware=True (and vial_sizes supplied) band doses are PLACED on
+    whole-vial totals rather than substituted into windows fixed by the
+    width-maximising greedy — far more zero-waste bands, at the cost of a
+    larger table. See `generate_band_doses_vial_aware`. Default is off: the
+    flag changes published output, so it is opt-in per call.
+
+    vials_shared=True suppresses vial-aware placement — see
+    `vial_aware_applies` for why, and call it to report the override.
     """
     name      = drug["drug_name"].strip()
     conc      = float(drug["concentration_mg_per_ml"])
@@ -372,9 +509,34 @@ def build_bands(
             vial_sizes, ceiling, max_per_vial
         )
 
-    band_doses = generate_band_doses(min_dose, max_dose, conc, var)
+    if vial_aware_applies(vial_sizes, vial_aware, vials_shared):
+        band_doses = generate_band_doses_vial_aware(
+            min_dose, max_dose, conc, var,
+            sorted({dose for dose, _ in vial_combos}),
+        )
+    else:
+        band_doses = generate_band_doses(min_dose, max_dose, conc, var)
     n          = len(band_doses)
     rows: list[dict] = []
+
+    def _waste_fields(v_waste: float, v_waste_pct: float):
+        """
+        Format the waste triple for one band.
+
+        When vials are pooled the residual is recovered for another patient, so
+        a non-zero figure is indicative rather than actual and is marked with a
+        leading '~'. The marker covers the cost as well as the mass: quoting an
+        exact currency figure for drug that will in fact be reused overstates
+        the saving, which is the number a business case leans on.
+        """
+        cost = round(v_waste * cost_per_mg, 2) if cost_per_mg is not None else ""
+        if vials_shared and v_waste > 1e-9:
+            return (
+                f"~{v_waste:.1f}",
+                f"~{v_waste_pct:.1f}",
+                f"~{cost:.2f}" if cost != "" else "",
+            )
+        return round(v_waste, 1), round(v_waste_pct, 1), cost
 
     for i, D in enumerate(band_doses):
 
@@ -423,15 +585,8 @@ def build_bands(
                 if abs(v_dose - D) > 1e-6:
                     D = v_dose
                 vial_combo_label = v_label
-                # Annotate with ~ when vials are shared and waste is non-zero
-                if vials_shared and v_waste > 1e-9:
-                    waste_mg      = f"~{v_waste:.1f}"
-                    waste_pct_val = f"~{v_waste_pct:.1f}"
-                else:
-                    waste_mg      = round(v_waste, 1)
-                    waste_pct_val = round(v_waste_pct, 1)
-                waste_cost_val = (
-                    round(v_waste * cost_per_mg, 2) if cost_per_mg is not None else ""
+                waste_mg, waste_pct_val, waste_cost_val = _waste_fields(
+                    v_waste, v_waste_pct
                 )
             else:
                 # No zero-waste combination fits the tolerance window.
@@ -444,14 +599,8 @@ def build_bands(
                     v_waste = round(v_dose - D, 4)
                     v_waste_pct = round(v_waste / D * 100, 1) if D > 0 else 0.0
                     vial_combo_label = v_label
-                    if vials_shared and v_waste > 1e-9:
-                        waste_mg      = f"~{v_waste:.1f}"
-                        waste_pct_val = f"~{v_waste_pct:.1f}"
-                    else:
-                        waste_mg      = round(v_waste, 1)
-                        waste_pct_val = round(v_waste_pct, 1)
-                    waste_cost_val = (
-                        round(v_waste * cost_per_mg, 2) if cost_per_mg is not None else ""
+                    waste_mg, waste_pct_val, waste_cost_val = _waste_fields(
+                        v_waste, v_waste_pct
                     )
                 vial_optimized = False
 

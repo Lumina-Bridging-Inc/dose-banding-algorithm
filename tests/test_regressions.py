@@ -21,6 +21,7 @@ from dose_banding import (
     get_dose_step_mg,
     get_vol_step_mL,
     verify_bands,
+    vial_aware_applies,
 )
 
 CONC_20 = 20.0
@@ -292,3 +293,201 @@ def test_vial_optimisation_does_not_change_the_bands_when_no_vials_given():
     empty = build_bands(cfg, vial_sizes=[], strict=True)
     assert [r["band_dose_mg"] for r in plain] == [r["band_dose_mg"] for r in empty]
     assert all(r["vial_combination"] == "" for r in plain)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VIAL-AWARE BAND PLACEMENT (v2.1.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Epirubicin 2 mg/mL, 50-260 mg, vials 10/50/200 — the configuration that
+# exposed the limitation. Phase 2 alone cannot reach the single 200 mg vial.
+EPIRUBICIN = (2.0, 50.0, 260.0)
+EPI_VIALS = [10.0, 50.0, 200.0]
+
+
+def test_substitution_window_lower_bound_collapses_to_the_band_dose():
+    """
+    Why vial-aware placement had to exist. `to_a_mg = D/(1-tau)`, so the
+    Phase 2 window's lower bound `to_a_mg*(1-tau)` is D itself: substitution
+    can only ever move a band dose UP. Any vial total below the greedy dose is
+    unreachable however attractive — which is the whole defect.
+    """
+    conc, lo, hi = EPIRUBICIN
+    rows = build_bands(traditional(conc, lo, hi), vial_sizes=EPI_VIALS, strict=True)
+
+    for row in rows[:-1]:      # last band's to_a is max_dose, not D/(1-tau)
+        D = float(row["band_dose_mg"])
+        tol_low = float(row["to_a_mg"]) * (1 - TAU)
+        assert tol_low == pytest.approx(D, abs=0.01)
+
+
+def test_vial_aware_placement_reaches_a_vial_size_the_greedy_cannot():
+    """
+    The 200 mg vial. Greedy placement puts a band at 202 mg and then cannot
+    substitute 200 mg because 200 < 202; vial-aware placement bands it at
+    200 mg drawn from one vial, with no waste.
+    """
+    conc, lo, hi = EPIRUBICIN
+    cfg = traditional(conc, lo, hi, "Epirubicin")
+
+    greedy = build_bands(cfg, vial_sizes=EPI_VIALS, strict=True)
+    aware = build_bands(cfg, vial_sizes=EPI_VIALS, strict=True, vial_aware=True)
+
+    assert 200.0 not in [float(r["band_dose_mg"]) for r in greedy]
+
+    band_200 = [r for r in aware if float(r["band_dose_mg"]) == 200.0]
+    assert len(band_200) == 1
+    assert band_200[0]["vial_combination"] == "1x200mg"
+    assert float(band_200[0]["waste_mg"]) == 0.0
+
+
+def test_vial_aware_placement_trades_band_count_for_zero_waste():
+    """
+    The trade the flag makes, pinned in both directions so neither side of it
+    can regress unnoticed: more bands, far less waste.
+    """
+    conc, lo, hi = EPIRUBICIN
+    cfg = traditional(conc, lo, hi, "Epirubicin")
+
+    greedy = build_bands(cfg, vial_sizes=EPI_VIALS, strict=True)
+    aware = build_bands(cfg, vial_sizes=EPI_VIALS, strict=True, vial_aware=True)
+
+    zero = lambda rows: sum(1 for r in rows if float(r["waste_mg"]) == 0.0)
+    waste = lambda rows: sum(float(r["waste_mg"]) for r in rows)
+
+    assert len(aware) > len(greedy)
+    assert zero(aware) > zero(greedy)
+    assert waste(aware) < waste(greedy)
+
+
+def test_vial_aware_is_off_by_default():
+    """
+    The flag changes published output, so it must never engage implicitly —
+    a caller that does not ask for it gets the tagged v2.0.1 bands.
+    """
+    conc, lo, hi = EPIRUBICIN
+    cfg = traditional(conc, lo, hi)
+    default = build_bands(cfg, vial_sizes=EPI_VIALS, strict=True)
+    explicit = build_bands(cfg, vial_sizes=EPI_VIALS, strict=True, vial_aware=False)
+    assert default == explicit
+
+
+def test_pooling_suppresses_vial_aware_placement():
+    """
+    Shared vials make the trade unprofitable — the residual is recovered for
+    another patient, so the "saved" drug would largely have been used anyway,
+    while the extra bands are real. A pooling site gets the greedy table.
+    """
+    conc, lo, hi = EPIRUBICIN
+    cfg = traditional(conc, lo, hi)
+
+    greedy = build_bands(cfg, vial_sizes=EPI_VIALS, vials_shared=True, strict=True)
+    aware = build_bands(cfg, vial_sizes=EPI_VIALS, vials_shared=True,
+                        strict=True, vial_aware=True)
+
+    assert [r["band_dose_mg"] for r in aware] == [r["band_dose_mg"] for r in greedy]
+    assert not vial_aware_applies(EPI_VIALS, vial_aware=True, vials_shared=True)
+    assert vial_aware_applies(EPI_VIALS, vial_aware=True, vials_shared=False)
+    assert not vial_aware_applies([], vial_aware=True, vials_shared=False)
+
+
+def test_pooled_waste_cost_is_marked_indicative():
+    """
+    waste_mg, waste_pct and waste_cost must agree on whether a figure is real.
+    An exact currency figure for drug that will in fact be reused overstates
+    the saving — and the cost is the number a business case leans on.
+    """
+    conc, lo, hi = EPIRUBICIN
+    cfg = traditional(conc, lo, hi)
+    rows = build_bands(cfg, vial_sizes=EPI_VIALS, vials_shared=True,
+                       cost_per_mg=3.20, strict=True)
+
+    marked = 0
+    for row in rows:
+        indicative = str(row["waste_mg"]).startswith("~")
+        assert str(row["waste_pct"]).startswith("~") == indicative
+        assert str(row["waste_cost"]).startswith("~") == indicative
+        if indicative:
+            marked += 1
+            waste = float(str(row["waste_mg"]).lstrip("~"))
+            cost = float(str(row["waste_cost"]).lstrip("~"))
+            assert cost == pytest.approx(waste * 3.20, abs=0.01)
+    assert marked, "no band carried a non-zero waste figure to mark"
+
+    # Unpooled, the same table quotes hard numbers.
+    for row in build_bands(cfg, vial_sizes=EPI_VIALS, vials_shared=False,
+                           cost_per_mg=3.20, strict=True):
+        assert not str(row["waste_cost"]).startswith("~")
+
+
+def test_vial_aware_without_vial_sizes_is_a_no_op():
+    """There is nothing to place bands on, so the greedy table must come back."""
+    cfg = traditional(CONC_20, 5.0, 380.0)
+    plain = build_bands(cfg, strict=True)
+    aware = build_bands(cfg, vial_sizes=[], strict=True, vial_aware=True)
+    assert [r["band_dose_mg"] for r in plain] == [r["band_dose_mg"] for r in aware]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEWEST VIALS FOR A GIVEN TOTAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("vial_aware", [False, True])
+def test_a_total_is_prepared_from_the_fewest_vials(vial_aware):
+    """
+    With 10/30/60 mg vials, 60 mg must be reported as one 60 mg vial rather
+    than two 30 mg vials, and 120 mg as two 60s rather than four 30s. Both the
+    zero-waste path and the minimum-waste fallback tie-break on vial count.
+    """
+    cfg = traditional(2.0, 50.0, 260.0, "ThreeVials")
+    rows = build_bands(cfg, vial_sizes=[10.0, 30.0, 60.0],
+                       strict=True, vial_aware=vial_aware)
+
+    by_dose = {float(r["band_dose_mg"]): r["vial_combination"] for r in rows}
+    expected = {60.0: "1x60mg", 120.0: "2x60mg", 240.0: "4x60mg"}
+    for dose, combo in expected.items():
+        if dose in by_dose:
+            assert by_dose[dose] == combo, f"{dose} mg prepared as {by_dose[dose]}"
+
+    # Whatever the table, no reported combination may be beaten on vial count
+    # by a different combination summing to the same total.
+    from dose_banding import _count_vials, enumerate_vial_combinations
+
+    combos = enumerate_vial_combinations([10.0, 30.0, 60.0], 300.0, 8)
+    fewest = {}
+    for total, label in combos:
+        n = _count_vials(label)
+        if total not in fewest or n < fewest[total]:
+            fewest[total] = n
+    for row in rows:
+        label = row["vial_combination"]
+        if not label:
+            continue
+        total = float(row["band_dose_mg"]) + float(row["waste_mg"])
+        assert _count_vials(label) == fewest[round(total, 6)], (
+            f"{label} is not the fewest-vial way to make {total} mg"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RELEASE METADATA
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_packaged_version_matches_the_module_version():
+    """
+    pyproject and `__version__` must agree. A dependant pins the tag and reads
+    the version back out of the module — the app stamps it into the header and
+    the detail CSV — so a drift means the deployed app misreports which
+    algorithm produced a published table. This went unnoticed through 2.0.1,
+    which is why it is pinned here rather than left to release discipline.
+    """
+    import re
+    from pathlib import Path
+
+    import dose_banding
+
+    pyproject = (Path(__file__).parent.parent / "pyproject.toml").read_text()
+    declared = re.search(r'^version = "([^"]+)"', pyproject, re.M).group(1)
+    assert declared == dose_banding.__version__, (
+        f"pyproject says {declared}, module says {dose_banding.__version__}"
+    )

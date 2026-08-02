@@ -28,6 +28,7 @@ from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
 from dose_banding import (
+    enumerate_vial_combinations,
     BOUNDARY_DP,
     VARIANCE,
     build_bands,
@@ -452,3 +453,81 @@ def test_tier_table_is_ordered_and_terminates():
     uppers = [t[0] for t in VOLUME_PRECISION_TIERS]
     assert uppers == sorted(uppers)
     assert math.isinf(uppers[-1]), "tier table must cover unbounded volumes"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VIAL-AWARE BAND PLACEMENT (v2.1.0) — P2 and P3 must survive the new path.
+#
+# P1 is deliberately NOT asserted here. A vial-exact band dose is exempt from
+# the graduation grid, on the rationale `verify_bands` already applies to
+# substituted bands: a zero-waste total is drawn from whole vials, so no
+# partial volume is measured. Placement makes that case the common one rather
+# than the exception, which is why P1 is checked below only for the fallback
+# doses — the steps where no vial total was admissible.
+# ─────────────────────────────────────────────────────────────────────────────
+
+VIAL_SETS = [[100.0], [100.0, 160.0], [10.0, 50.0, 200.0], [10.0, 30.0, 60.0]]
+
+
+@SETTINGS
+@given(cfg=well_posed_config(), vials=st.sampled_from(VIAL_SETS))
+def test_vial_aware_tables_keep_the_guarantees(cfg, vials):
+    """
+    The flag buys zero-waste preparation; it may not buy it with tolerance or
+    coverage. Strict mode either refuses or returns a table passing P1-P3 as
+    `verify_bands` judges them.
+    """
+    tau = VARIANCE[cfg["drug_type"]]
+    try:
+        rows = build_bands(cfg, vial_sizes=vials, strict=True, vial_aware=True)
+    except ValueError:
+        return  # refusal is an acceptable outcome
+    assert verify_bands(rows, tau, cfg["concentration_mg_per_ml"]) == []
+
+
+@SETTINGS
+@given(cfg=well_posed_config(), vials=st.sampled_from(VIAL_SETS))
+def test_vial_aware_band_doses_are_vial_exact_or_dispensable(cfg, vials):
+    """
+    Every band dose is justified one way or the other: either it is a whole-vial
+    total (drawn entire, no measurement) or it sits on the graduation grid.
+    Nothing in between — that would be a dose no one can actually prepare.
+    """
+    conc = cfg["concentration_mg_per_ml"]
+    try:
+        rows = build_bands(cfg, vial_sizes=vials, strict=True, vial_aware=True)
+    except ValueError:
+        return
+
+    totals = {d for d, _ in enumerate_vial_combinations(
+        vials, cfg["max_dose_mg"] * 1.10, 8)}
+
+    for row in rows:
+        D = float(row["band_dose_mg"])
+        if any(abs(D - t) < 1e-6 for t in totals):
+            continue
+        vol = D / conc
+        step = vol_step_for(vol)
+        ratio = vol / step
+        assert abs(ratio - round(ratio)) < 1e-6, (
+            f"band {D} mg is neither a vial total nor on the {step} mL grid"
+        )
+
+
+@SETTINGS
+@given(cfg=well_posed_config(), vials=st.sampled_from(VIAL_SETS))
+def test_vial_aware_never_produces_a_worse_waste_total(cfg, vials):
+    """
+    Placement exists to reduce waste. It is allowed to spend bands doing so,
+    but it must never come out behind the greedy table on the metric it is
+    optimising — that would mean the extra bands bought nothing.
+    """
+    def total_waste(rows):
+        return sum(float(str(r["waste_mg"]).lstrip("~") or 0) for r in rows)
+
+    try:
+        greedy = build_bands(cfg, vial_sizes=vials, strict=True)
+        aware = build_bands(cfg, vial_sizes=vials, strict=True, vial_aware=True)
+    except ValueError:
+        return
+    assert total_waste(aware) <= total_waste(greedy) + 1e-6
