@@ -11,8 +11,10 @@ clone the repository, run this command, and obtain every published number.
 """
 
 import csv
+from contextlib import contextmanager
 from pathlib import Path
 
+import dose_banding as db
 from dose_banding import (
     NHS_20_REF,
     VARIANCE,
@@ -264,6 +266,197 @@ def published_extent() -> None:
     write_band_csv(rows, OUT / "algorithm_bands_5-6368mg.csv")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# §4.5 — SYRINGE FILL-POLICY SENSITIVITY
+#
+# The published tiers assume a dose is drawn in a single syringe of the
+# smallest calibrated capacity sufficient to contain it. Where a site caps the
+# fill of a hazardous-drug syringe at a fraction of calibrated capacity — BC
+# Cancer applies 75%, to prevent plunger–barrel separation — the syringe
+# actually used is one size larger over part of the range, so the tier
+# BOUNDARIES move to the usable volumes. The graduation values do not move:
+# they are physical properties of the same syringes.
+#
+# Nothing below changes the published output. The tier table is swapped for
+# the duration of a call and restored, which is the point being made in §4.5 —
+# the tiers are declared configuration, not band construction logic.
+# ─────────────────────────────────────────────────────────────────────────────
+
+FILL_FRACTION = 0.75
+
+# (upper_volume_mL_exclusive, volume_step_mL), boundaries at 75% of the
+# calibrated capacity of the syringe that carries each graduation:
+#   1 mL syringe  -> 0.75 mL usable, 0.01 mL graduation
+#   3 mL syringe  -> 2.25 mL usable, 0.10 mL
+#   5 and 10 mL   -> 3.75 / 7.50 mL usable, 0.20 mL for both, so 7.50 binds
+#   20 mL upward  -> 1.00 mL, unchanged; volumes past one syringe are aliquoted
+REBASED_TIERS: list[tuple[float, float]] = [
+    (0.75,         0.01),
+    (2.25,         0.10),
+    (7.50,         0.20),
+    (float('inf'), 1.00),
+]
+
+# Sweep grid. Stated in §4.5 as eighteen concentrations, 400 minimum doses
+# spanning 0.05–20 mL, and a range of forty times the minimum dose.
+SWEEP_CONCS = [0.5, 1, 2, 2.5, 3, 4, 5, 6, 10,
+               12.5, 20, 25, 30, 40, 50, 60, 80, 100]
+SWEEP_VOLS = [x / 100 for x in range(5, 2001, 5)]
+SWEEP_RANGE_MULTIPLE = 40
+
+
+@contextmanager
+def tiers(table: list[tuple[float, float]]):
+    """Run a block against a different graduation tier table.
+
+    Mutated in place rather than rebound: get_vol_step_mL closes over the
+    module global by name, and an in-place swap cannot be defeated by anything
+    else holding a reference to the same list.
+    """
+    saved = list(db.VOLUME_PRECISION_TIERS)
+    db.VOLUME_PRECISION_TIERS[:] = table
+    try:
+        yield
+    finally:
+        db.VOLUME_PRECISION_TIERS[:] = saved
+
+
+def min_feasible_tolerance(table: list[tuple[float, float]]) -> float:
+    """Worst-case δ over the tier transitions, per condition (ii) of Lemma #1.
+
+    The condition is s(M) ≤ D·2δ/(1−δ) with M = D(1+δ)/(1−δ). A transition at
+    volume Vt to graduation g is therefore reached with a window of Vt·2δ/(1+δ),
+    and g ≤ Vt·2δ/(1+δ) rearranges to δ ≥ g/(2·Vt − g).
+    """
+    return max(g / (2 * vt - g)
+               for (vt, _), (_, g) in zip(table, table[1:]))
+
+
+def feasibility_sweep() -> tuple[int, int, int, int]:
+    """(lost, gained, ok_both, bad_both) across the sweep grid at ±6%."""
+    lost = gained = ok_both = bad_both = 0
+    for conc in SWEEP_CONCS:
+        for vol in SWEEP_VOLS:
+            lo = round(vol * conc, 4)
+            drug = {"drug_name": "sweep", "concentration_mg_per_ml": conc,
+                    "drug_type": DTYPE, "min_dose_mg": lo,
+                    "max_dose_mg": lo * SWEEP_RANGE_MULTIPLE}
+            ok = []
+            for table in (db.VOLUME_PRECISION_TIERS[:], REBASED_TIERS):
+                with tiers(table):
+                    try:
+                        build_bands(drug)
+                        ok.append(True)
+                    except ValueError:
+                        ok.append(False)
+            published, rebased = ok
+            if published and not rebased:
+                lost += 1
+            elif rebased and not published:
+                gained += 1
+            elif published:
+                ok_both += 1
+            else:
+                bad_both += 1
+    return lost, gained, ok_both, bad_both
+
+
+def fill_policy_sensitivity() -> None:
+    """Regenerate every figure quoted in §4.5 on the fill-policy limitation.
+
+    No CSV: none of this is a published table. It is the arithmetic behind a
+    limitations paragraph, and a reviewer should be able to obtain it by
+    running this script.
+    """
+    print(f"\n{'=' * 74}\n  §4.5 FILL-POLICY SENSITIVITY: tier boundaries "
+          f"rebased on {FILL_FRACTION:.0%} of calibrated capacity\n{'=' * 74}")
+
+    print("  Tier boundaries (mL), published -> rebased")
+    for (pub_v, pub_g), (reb_v, reb_g) in zip(db.VOLUME_PRECISION_TIERS,
+                                              REBASED_TIERS):
+        assert pub_g == reb_g, "graduation values must not move"
+        lo = "inf" if pub_v == float("inf") else f"{pub_v:g}"
+        hi = "inf" if reb_v == float("inf") else f"{reb_v:g}"
+        print(f"    < {lo:>4} -> < {hi:>4}   graduation {pub_g:g} mL")
+
+    print("\n  Coarsened intervals (the volumes where the tiers disagree)")
+    for lo, hi, was, now in ((0.75, 1.00, 0.01, 0.10),
+                             (2.25, 3.00, 0.10, 0.20),
+                             (7.50, 10.00, 0.20, 1.00)):
+        print(f"    {lo:>5.2f}–{hi:<5.2f} mL   {was:g} mL -> {now:g} mL "
+              f"({now / was:g}x coarser)")
+
+    # ── effect on the three tables reported in the paper ────────────────────
+    def agreement(rows, max_dose):
+        comp = compare(rows, max_dose)
+        n = sum(1 for r in comp if r["outcome"] == "Agreement")
+        return n, len(comp)
+
+    print("\n  Effect on the tables reported in this paper")
+    print(f"  {'Comparison':<28} {'bands':>13} {'agreement':>21}")
+    for max_dose, label in ((PAPER_MAX, "20 mg/mL, 5–380 mg"),
+                            (PUBLISHED_MAX, "20 mg/mL, full 73-band")):
+        pub = build_bands(cfg(max_dose))
+        with tiers(REBASED_TIERS):
+            reb = build_bands(cfg(max_dose))
+        pa, pn = agreement(pub, max_dose)
+        ra, _ = agreement(reb, max_dose)
+        print(f"  {label:<28} {len(pub):>5} -> {len(reb):<5} "
+              f"{pa}/{pn} = {pa / pn * 100:>4.1f}% -> {ra / pn * 100:>4.1f}%")
+        if max_dose == PAPER_MAX:
+            moved = _moved_doses(pub, reb)
+
+    print(f"\n  Band doses that move over 5–380 mg: "
+          f"{', '.join(f'{a:g} -> {b:g} mg' for a, b in moved)}")
+
+    ref_path = Path("nhs_6mgml_ref.csv")
+    if ref_path.exists():
+        ref = [(float(r["from_mg"]), float(r["to_a_mg"]), float(r["band_dose_mg"]))
+               for r in csv.DictReader(open(ref_path, encoding="utf-8"))]
+        oos = {"drug_name": "Paclitaxel", "concentration_mg_per_ml": 6.0,
+               "drug_type": DTYPE, "min_dose_mg": ref[0][0],
+               "max_dose_mg": ref[-1][1]}
+        pub = build_bands(oos)
+        with tiers(REBASED_TIERS):
+            reb = build_bands(oos)
+        moved_oos = _moved_doses(pub, reb)
+        print(f"  Out-of-sample 6 mg/mL:       {len(pub):>5} -> {len(reb):<5} "
+              f"bands; {len(moved_oos)} band dose(s) move "
+              f"({', '.join(f'{a:g} -> {b:g} mg' for a, b in moved_oos)})")
+
+    # ── effect on feasibility ───────────────────────────────────────────────
+    pub_delta = min_feasible_tolerance(db.VOLUME_PRECISION_TIERS)
+    reb_delta = min_feasible_tolerance(REBASED_TIERS)
+    print(f"\n  Lemma #1 condition (ii), minimum tolerance over all transitions")
+    print(f"    published tiers ... {pub_delta * 100:.2f}%")
+    print(f"    rebased tiers ..... {reb_delta * 100:.2f}%   "
+          f"(above both the ±6.0% NHS principle and the ±6.5% NCCP ceiling)")
+
+    lost, gained, ok_both, bad_both = feasibility_sweep()
+    total = lost + gained + ok_both + bad_both
+    print(f"\n  Feasibility sweep, {total} configurations at ±{VAR * 100:g}% "
+          f"({len(SWEEP_CONCS)} concentrations x {len(SWEEP_VOLS)} minimum "
+          f"doses)")
+    print(f"    feasible on both ................. {ok_both}")
+    print(f"    infeasible on both ............... {bad_both}")
+    print(f"    lost (published -> rebased) ...... {lost}  "
+          f"= {lost / total * 100:.1f}% of the grid")
+    print(f"    gained (rebased -> published) .... {gained}")
+    print("    every loss raised ValueError; no table was emitted "
+          "non-compliant")
+
+
+def _moved_doses(pub: list[dict], reb: list[dict]) -> list[tuple[float, float]]:
+    """Published band doses absent from the rebased table, and what replaced them."""
+    reb_doses = [float(r["band_dose_mg"]) for r in reb]
+    out = []
+    for r in pub:
+        d = float(r["band_dose_mg"])
+        if not any(abs(d - x) <= 1e-6 for x in reb_doses):
+            out.append((d, min(reb_doses, key=lambda x: abs(x - d))))
+    return out
+
+
 def main() -> None:
     rows_380 = report(PAPER_MAX, "5-380mg")
     table4_excerpt(rows_380)
@@ -271,6 +464,7 @@ def main() -> None:
     published_extent()
     report(PUBLISHED_MAX, "5-6368mg")
     out_of_sample()
+    fill_policy_sensitivity()
     print(f"\n  CSVs written to {OUT.resolve()}\n")
 
 
