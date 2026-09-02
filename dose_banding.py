@@ -54,6 +54,11 @@ from pathlib import Path
 #                 (`build_bands(..., vial_aware=True)`). Default is off, so
 #                 2.0.1 output is reproduced byte for byte unless the caller
 #                 asks for the new behaviour.
+#   2.2.0.dev2  — UNRELEASED: reports `divides_equally` per band — whether
+#                 `total volume / syringe count` is itself measurable, which is
+#                 all many HIS implementations can compute. `balanced` fails it
+#                 for most multi-syringe bands, so the flag has to be published
+#                 rather than left implicit.
 #   2.2.0.dev1  — UNRELEASED: adds the `balanced` split strategy, which lets
 #                 the fills differ by one graduation instead of requiring them
 #                 identical. Much cheaper in bands; `equal` stays the default.
@@ -70,7 +75,7 @@ from pathlib import Path
 #                 producing a 2 mg-wide band next to a near-identical one.
 #                 Changes vial_aware=True output only; the default is untouched.
 # Bump this in the same commit as the release tag.
-__version__ = "2.2.0.dev1"
+__version__ = "2.2.0.dev2"
 from typing import Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -642,6 +647,26 @@ def _aliquot_split(volume_mL: float, syringes: list) -> list[float]:
     return fills
 
 
+def divides_equally(volume_mL: float, k: int, syringes: list) -> bool:
+    """
+    Whether dividing the total volume by the syringe count lands on a graduation.
+
+    This is the split a downstream system computes when all it can do is
+    `total / count` — which is all many HIS implementations can do. Such a
+    system does not read the split we publish; it re-derives one. So a band
+    whose equal division is not measurable is unusable there however carefully
+    the split was chosen here, because the system will hand nursing its own
+    arithmetic instead.
+
+    Reported per band rather than assumed: `equal` makes it true for every band
+    it can place cleanly, but a fallback band is aliquot-split and a `balanced`
+    band is deliberately uneven, and both then fail this.
+    """
+    fill  = volume_mL / k
+    entry = select_syringe(fill, syringes)
+    return entry is not None and _on_graduation(fill, entry[1])
+
+
 def describe_split(
     dose_mg:       float,
     conc:          float,
@@ -659,6 +684,10 @@ def describe_split(
       aligned       True when the strategy's constraint is met exactly — for
                     `equal`, k identical fills each on its barrel's graduation
       exceeds_max   True when n_syringes > max_syringes
+      divides_equally  True when `total volume / syringe count` is itself on a
+                    graduation — see `divides_equally`. This is what a system
+                    that can only divide will compute, so a False here means
+                    the published split cannot be relied on downstream.
 
     `aligned=False` is not a failure: the dose is still prepared, as successive
     aliquots. It records that this band did not get the cleaner preparation, so
@@ -678,6 +707,7 @@ def describe_split(
                 "capacity":    entry[0],
                 "aligned":     True,
                 "exceeds_max": exceeds,
+                "divides_equally": True,
             }
 
     elif strategy == "balanced":
@@ -711,6 +741,8 @@ def describe_split(
                 "capacity":    capacity,
                 "aligned":     True,
                 "exceeds_max": exceeds,
+                # An uneven balanced split is NOT what total/count gives.
+                "divides_equally": extra == 0,
             }
 
     fills = _aliquot_split(volume_mL, syringes)
@@ -722,6 +754,7 @@ def describe_split(
         "capacity":    caps.pop() if len(caps) == 1 else None,
         "aligned":     False,
         "exceeds_max": len(fills) > max_syringes,
+        "divides_equally": divides_equally(volume_mL, len(fills), syringes),
     }
 
 
@@ -1100,6 +1133,7 @@ def build_bands(
         syringe_split_out = ""
         split_aligned_out = ""
         exceeds_max_out   = ""
+        divides_equally_out = ""
 
         if syringes is not None:
             split = describe_split(
@@ -1110,6 +1144,7 @@ def build_bands(
             syringe_split_out = format_split(split)
             split_aligned_out = split["aligned"]
             exceeds_max_out   = split["exceeds_max"]
+            divides_equally_out = split["divides_equally"]
 
         # ── Actual variance at boundaries ────────────────────────────────────
         # Below: patient at from_mg receives D  →  positive = over-dose
@@ -1151,6 +1186,7 @@ def build_bands(
             "syringe_split":           syringe_split_out,
             "split_aligned":           split_aligned_out,
             "exceeds_max_syringes":    exceeds_max_out,
+            "divides_equally":         divides_equally_out,
             # Provenance: a downloaded table is often detached from the tool
             # that produced it, so it has to carry its own version.
             "algorithm_version":       __version__,
@@ -1450,7 +1486,7 @@ BAND_FIELDS = [
     "vial_combination", "waste_mg", "waste_pct", "waste_cost", "vial_optimized",
     # multi-syringe splitting — empty strings for drugs without a route_profile
     "route_profile", "n_syringes", "syringe_split", "split_aligned",
-    "exceeds_max_syringes",
+    "exceeds_max_syringes", "divides_equally",
     # provenance — deliberately NOT added to the Cerner export, which must
     # match the standardised dose range screen field for field
     "algorithm_version",

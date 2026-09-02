@@ -450,3 +450,70 @@ def test_equal_remains_the_default():
     for row in default:
         if row["n_syringes"] > 1 and row["split_aligned"]:
             assert len(set(fills_of(row))) == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REPRODUCIBILITY BY A SYSTEM THAT CAN ONLY DIVIDE
+#
+# Many HIS implementations cannot carry a published split; all they can do is
+# `total volume / syringe count`. Such a system re-derives the split rather than
+# reading ours, so a band whose equal division is not measurable is unusable
+# there no matter how carefully the split was chosen here.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def divides_on_a_graduation(volume_mL, k):
+    """Re-derived from the inventory, not from the module's own helper."""
+    fill = volume_mL / k
+    found = barrel_for(fill)
+    return found is not None and on_graduation(fill, found[1])
+
+
+@pytest.mark.parametrize("conc,lo,hi,dtype", SPLIT_CASES)
+def test_divides_equally_matches_an_independent_derivation(conc, lo, hi, dtype):
+    for row in split_rows(conc, lo, hi, dtype):
+        assert row["divides_equally"] == divides_on_a_graduation(
+            row["volume_mL"], row["n_syringes"]
+        ), row["syringe_split"]
+
+
+@pytest.mark.parametrize("conc,lo,hi,dtype", SPLIT_CASES)
+def test_equal_keeps_every_in_limit_band_reproducible(conc, lo, hi, dtype):
+    """
+    The property that makes `equal` the safe default for these sites. Held
+    across every configuration checked; bands over the syringe limit are
+    excluded because they are already flagged as unusable as they stand.
+    """
+    for row in split_rows(conc, lo, hi, dtype):
+        if row["n_syringes"] > 1 and not row["exceeds_max_syringes"]:
+            assert row["divides_equally"], (
+                f"{row['band_dose_mg']} mg = {row['volume_mL']} mL over "
+                f"{row['n_syringes']} syringes is not an equal division"
+            )
+
+
+@pytest.mark.parametrize("conc,lo,hi,dtype", SPLIT_CASES)
+def test_an_uneven_balanced_split_is_never_marked_reproducible(conc, lo, hi, dtype):
+    """
+    The claim that matters for `balanced`: it must not present a split a
+    dividing system would fail to reproduce as though it would.
+    """
+    for row in balanced_rows(conc, lo, hi, dtype):
+        fills = fills_of(row)
+        if len(set(fills)) > 1:
+            assert not row["divides_equally"], row["syringe_split"]
+
+
+def test_balanced_really_does_break_reproducibility():
+    """
+    Pinned so the trade-off cannot quietly disappear: if this stops failing,
+    balanced has become equal and the option is pointless.
+    """
+    rows = balanced_rows(2.0, 60.0, 220.0)
+    multi = [r for r in rows if r["n_syringes"] > 1]
+    assert any(not r["divides_equally"] for r in multi)
+
+
+def test_a_single_syringe_band_always_divides_equally():
+    for row in split_rows(2.0, 40.0, 160.0):
+        if row["n_syringes"] == 1:
+            assert row["divides_equally"]
