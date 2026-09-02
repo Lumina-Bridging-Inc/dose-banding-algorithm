@@ -54,12 +54,20 @@ from pathlib import Path
 #                 (`build_bands(..., vial_aware=True)`). Default is off, so
 #                 2.0.1 output is reproduced byte for byte unless the caller
 #                 asks for the new behaviour.
-#   2.1.1       — current: vial-aware placement now requires a band dose to sit
+#   2.2.0.dev0  — UNRELEASED: adds opt-in split-aware band placement for doses
+#                 that need more than one syringe (`build_bands(...,
+#                 route_profile=...)`), with the BC Cancer 75% hazardous fill
+#                 limit and route volume caps. Default is off, so 2.1.1 output
+#                 is reproduced byte for byte unless the caller asks for it.
+#                 The .dev0 marker is deliberate: this version stamp is written
+#                 into every band CSV, so it must never claim a released
+#                 version while the code is still being tested.
+#   2.1.1       — vial-aware placement now requires a band dose to sit
 #                 inside its own band. 2.1.0 could seat one beneath its range,
 #                 producing a 2 mg-wide band next to a near-identical one.
 #                 Changes vial_aware=True output only; the default is untouched.
 # Bump this in the same commit as the release tag.
-__version__ = "2.1.1"
+__version__ = "2.2.0.dev0"
 from typing import Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -460,17 +468,387 @@ def generate_band_doses_vial_aware(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MULTI-SYRINGE SPLITTING
+#
+# A dose too large for one syringe is split across several. Sites cap the volume
+# handed to nursing for an IV push on ergonomic grounds — BC Cancer uses 30 mL,
+# citing doxorubicin — and hazardous-drug syringes are additionally filled to no
+# more than a fraction of calibrated capacity (BC Cancer: 75%) to guard against
+# plunger–barrel separation.
+#
+# The consequence for banding is that the dispensable lattice COARSENS. For an
+# equal split into k syringes the per-syringe volume is V/k and must be a
+# multiple of that barrel's graduation g, so the total V must be a multiple of
+# k×g — a lattice k times coarser than the one `generate_band_doses` uses. A
+# band dose chosen for the total volume alone therefore usually does not survive
+# division: at 2 mg/mL, 6 of 10 multi-syringe doxorubicin bands and 7 of 12
+# epirubicin bands land on a per-syringe volume no barrel is marked for
+# (e.g. 148 mg → 74 mL → 24.667 mL each).
+#
+# Splitting after placement cannot fix that, because the dose was never
+# divisible. So divisibility is made a PLACEMENT constraint here, exactly as
+# whole-vial totals were in 2.1.0.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Fraction of calibrated capacity a hazardous-drug syringe may be filled to.
+# BC Cancer, Pharmacy FAQ — Volume Maximums for IV Bags & Syringes (rev. May
+# 2026). Site-configurable: this is declared data, not logic.
+HAZARDOUS_FILL_FRACTION: float = 0.75
+
+# (calibrated capacity mL, graduation mL, max fill override mL)
+#
+# Graduations agree with VOLUME_PRECISION_TIERS by construction and
+# `test_inventory_agrees_with_tiers` holds the two in step. In particular the
+# 50 and 60 mL barrels are graduated at 1 mL, not the 2 mL some fill-limit
+# guidance assumes — established for this module by the 2026-07-31 out-of-sample
+# validation against the NHS England 6 mg/mL v2 table (see the tier note above),
+# and confirmed independently against Baxter and Equashield product information
+# on 2026-09-02.
+#
+# The override column carries site exceptions to the fill fraction. It is None
+# throughout at present: BC Cancer permits the BD 60 mL barrel to be filled to
+# 45 mL, which is exactly 75% of 60, so no exception is needed to express it.
+SYRINGE_INVENTORY: list[tuple[float, float, Optional[float]]] = [
+    (1.0,  0.01, None),
+    (3.0,  0.10, None),
+    (5.0,  0.20, None),
+    (10.0, 0.20, None),
+    (20.0, 1.00, None),
+    (30.0, 1.00, None),
+    (50.0, 1.00, None),
+    (60.0, 1.00, None),
+]
+
+# Route profile → maximum volume per syringe handed to nursing (mL), or None
+# for "the fill limit is the only constraint". The push cap is ergonomic and is
+# not waived by a closed-system device, so it is orthogonal to the fill fraction.
+ROUTE_PROFILES: dict[str, Optional[float]] = {
+    "iv_push": 30.0,
+    "syringe": None,
+}
+
+DEFAULT_MAX_SYRINGES: int = 4
+
+SPLIT_STRATEGIES = ("equal",)
+
+
+def parse_route_profile(raw) -> Optional[str]:
+    """
+    Parse the route_profile field. Empty/absent → None, which leaves splitting
+    off and reproduces default output exactly. Mirrors `parse_vial_sizes`.
+    """
+    if raw is None:
+        return None
+    name = str(raw).strip().lower()
+    if not name:
+        return None
+    if name not in ROUTE_PROFILES:
+        raise ValueError(
+            f"unknown route_profile {name!r} — expected one of "
+            f"{', '.join(sorted(ROUTE_PROFILES))}, or empty to disable splitting"
+        )
+    return name
+
+
+def usable_fill_mL(
+    capacity:      float,
+    override:      Optional[float],
+    fill_fraction: float,
+    route_max_mL:  Optional[float],
+) -> float:
+    """Largest volume this barrel may hold, given fill policy and route cap."""
+    fill = override if override is not None else fill_fraction * capacity
+    if route_max_mL is not None:
+        fill = min(fill, route_max_mL)
+    return fill
+
+
+def build_syringe_set(
+    route_profile: str,
+    inventory:     Optional[list] = None,
+    fill_fraction: float = HAZARDOUS_FILL_FRACTION,
+) -> list[tuple[float, float, float, float]]:
+    """
+    Return the usable barrels for a route, as
+    `(capacity, graduation, reign_low_exclusive, reign_high_inclusive)`.
+
+    A barrel's "reign" is the interval of fill volumes for which it is the
+    SMALLEST barrel that fits — which is the one a pharmacist reaches for, and
+    so the one whose graduation applies. Barrels whose usable fill is no greater
+    than a smaller barrel's are shadowed and dropped: under a 30 mL push cap the
+    50 and 60 mL barrels both cap out at 30 mL, so the 60 is never selected.
+    """
+    route_max = ROUTE_PROFILES[route_profile]
+    inv = SYRINGE_INVENTORY if inventory is None else inventory
+
+    out: list[tuple[float, float, float, float]] = []
+    prev_high = 0.0
+    for capacity, graduation, override in sorted(inv, key=lambda s: s[0]):
+        high = usable_fill_mL(capacity, override, fill_fraction, route_max)
+        if high <= prev_high + 1e-9:
+            continue
+        out.append((capacity, graduation, prev_high, high))
+        prev_high = high
+    return out
+
+
+def max_fill_mL(syringes: list) -> float:
+    """Largest volume any single barrel may hold on this route."""
+    return max(high for _, _, _, high in syringes)
+
+
+def select_syringe(fill_mL: float, syringes: list) -> Optional[tuple]:
+    """Smallest barrel whose usable fill holds `fill_mL`, or None if too large."""
+    for entry in syringes:
+        if fill_mL <= entry[3] + 1e-9:
+            return entry
+    return None
+
+
+def _on_graduation(volume_mL: float, graduation: float) -> bool:
+    return abs(volume_mL / graduation - round(volume_mL / graduation)) < 1e-6
+
+
+def _min_syringes(volume_mL: float, syringes: list) -> int:
+    """Fewest barrels that can hold `volume_mL` between them."""
+    return max(1, math.ceil(volume_mL / max_fill_mL(syringes) - 1e-9))
+
+
+def _aliquot_split(volume_mL: float, syringes: list) -> list[float]:
+    """
+    Successive aliquots: draw the usable maximum until the remainder fits.
+
+    This is what the tier model already assumes for volumes beyond one syringe
+    (see the VOLUME_PRECISION_TIERS note), and it is the fallback whenever the
+    requested strategy cannot be satisfied exactly.
+    """
+    cap = max_fill_mL(syringes)
+    fills = []
+    remaining = volume_mL
+    while remaining > cap + 1e-9:
+        fills.append(cap)
+        remaining -= cap
+    fills.append(round(remaining, 9))
+    return fills
+
+
+def describe_split(
+    dose_mg:       float,
+    conc:          float,
+    syringes:      list,
+    max_syringes:  int = DEFAULT_MAX_SYRINGES,
+    strategy:      str = "equal",
+) -> dict:
+    """
+    Describe how `dose_mg` would actually be prepared on this route.
+
+    Returns a dict with:
+      n_syringes    fewest barrels the volume forces
+      fills         per-syringe volumes (mL)
+      capacity      barrel used, when every fill shares one; else None
+      aligned       True when the strategy's constraint is met exactly — for
+                    `equal`, k identical fills each on its barrel's graduation
+      exceeds_max   True when n_syringes > max_syringes
+
+    `aligned=False` is not a failure: the dose is still prepared, as successive
+    aliquots. It records that this band did not get the cleaner preparation, so
+    the caller can report it.
+    """
+    volume_mL = dose_mg / conc
+    k = _min_syringes(volume_mL, syringes)
+    exceeds = k > max_syringes
+
+    if strategy == "equal":
+        fill = volume_mL / k
+        entry = select_syringe(fill, syringes)
+        if entry is not None and _on_graduation(fill, entry[1]):
+            return {
+                "n_syringes":  k,
+                "fills":       [round(fill, 9)] * k,
+                "capacity":    entry[0],
+                "aligned":     True,
+                "exceeds_max": exceeds,
+            }
+
+    fills = _aliquot_split(volume_mL, syringes)
+    caps = {select_syringe(f, syringes)[0] for f in fills
+            if select_syringe(f, syringes) is not None}
+    return {
+        "n_syringes":  len(fills),
+        "fills":       fills,
+        "capacity":    caps.pop() if len(caps) == 1 else None,
+        "aligned":     False,
+        "exceeds_max": len(fills) > max_syringes,
+    }
+
+
+def format_split(split: dict) -> str:
+    """Render a split for the detail CSV, e.g. '26 mL + 26 mL (50 mL syringes)'."""
+    if not split["fills"]:
+        return ""
+    body = " + ".join(f"{f:g} mL" for f in split["fills"])
+    cap = split["capacity"]
+    if cap is None:
+        return body
+    plural = "syringe" if len(split["fills"]) == 1 else "syringes"
+    return f"{body} ({cap:g} mL {plural})"
+
+
+def enumerate_split_totals(
+    conc:         float,
+    ceiling_mg:   float,
+    syringes:     list,
+    max_syringes: int = DEFAULT_MAX_SYRINGES,
+    strategy:     str = "equal",
+) -> list[tuple[float, int]]:
+    """
+    Every dose up to `ceiling_mg` that splits cleanly, as sorted (dose_mg, k).
+
+    For `equal`, walk each barrel's graduation grid across its own reign and
+    take k copies of each mark. The barrel that owns a fill volume is fixed by
+    the reign, so the graduation is too, and no dose is generated on a
+    graduation finer than the barrel it would actually be drawn in.
+
+    A candidate is kept only when k is the MINIMUM number of barrels its total
+    volume forces. Without that guard the enumeration is happy to return
+    46.4 mg as 4 × 5.8 mL when 23.2 mL fits a single barrel — arithmetically
+    valid, clinically absurd.
+    """
+    if strategy not in SPLIT_STRATEGIES:
+        raise ValueError(
+            f"unknown split_strategy {strategy!r} — expected one of "
+            f"{', '.join(SPLIT_STRATEGIES)}"
+        )
+
+    cap = max_fill_mL(syringes)
+    ceiling_vol = ceiling_mg / conc
+    best: dict[float, int] = {}
+
+    for k in range(1, max_syringes + 1):
+        for _capacity, graduation, reign_low, reign_high in syringes:
+            first = math.floor(reign_low / graduation + 1e-9) + 1
+            last  = math.floor(reign_high / graduation + 1e-9)
+            for n in range(max(first, 1), last + 1):
+                fill  = n * graduation
+                total = k * fill
+                if total > ceiling_vol + 1e-9:
+                    break
+                # Minimum-syringe guard.
+                if k != max(1, math.ceil(total / cap - 1e-9)):
+                    continue
+                dose = round(conc * total, 9)
+                if dose not in best or k < best[dose]:
+                    best[dose] = k
+
+    return sorted(best.items())
+
+
+def split_aware_applies(route_profile: Optional[str], vial_sizes: Optional[list]) -> bool:
+    """
+    Whether split-aware placement will engage.
+
+    Exposed so a front end can report the decision rather than re-deriving it,
+    matching `vial_aware_applies`.
+    """
+    return bool(route_profile) and not vial_sizes
+
+
+def generate_band_doses_split_aware(
+    min_dose:     float,
+    max_dose:     float,
+    conc:         float,
+    var:          float,
+    split_totals: list,
+) -> list[float]:
+    """
+    As `generate_band_doses`, but PLACES bands on doses that divide cleanly
+    across the syringes their volume requires.
+
+    Selection inside each admissible window is by fewest syringes first, then
+    widest band. Fewest-first matters: without it a window will happily take a
+    dose a few mg wider that tips the preparation into an extra syringe, which
+    is a worse trade than the band width is worth.
+
+    The plan for this function also proposed ranking by finest graduation as a
+    third criterion. It is not implemented because it is inert: every candidate
+    in the list is already exactly dispensable, so a finer graduation buys
+    nothing once a dose has been admitted. Graduation fineness affects how MANY
+    candidates exist — which the enumeration captures on its own — not which of
+    them is preferable.
+
+    Doses where no candidate is admissible fall back to the graduation-aligned
+    greedy and are prepared as successive aliquots, exactly as today.
+    """
+    def pick(low: float, high: float) -> Optional[float]:
+        window = [(d, k) for d, k in split_totals if low - 1e-9 <= d <= high + 1e-9]
+        if not window:
+            return None
+        fewest = min(k for _, k in window)
+        return max(d for d, k in window if k == fewest)
+
+    # ── First band dose ───────────────────────────────────────────────────────
+    # Same admissible interval as the greedy opening, [min_dose, min_dose*(1+var)],
+    # which is only var% wide — half the room later steps get.
+    D0_max = min_dose * (1.0 + var)
+    D0     = pick(min_dose, D0_max)
+
+    if D0 is None:
+        step0 = get_dose_step_mg(D0_max, conc)
+        D0    = floor_to_step(D0_max, step0)
+        if D0 < min_dose - 1e-9:
+            D0 += step0
+
+    band_doses: list[float] = [round(D0, 10)]
+
+    # ── Subsequent band doses ─────────────────────────────────────────────────
+    while True:
+        D_prev = band_doses[-1]
+
+        # Gap-free coverage bounds the advance exactly as in the greedy case.
+        cap = D_prev * (1.0 + var) / (1.0 - var)
+
+        # The band dose must sit inside its own band, for the reason given in
+        # `generate_band_doses_vial_aware`: a dose beneath its own lower
+        # boundary is admissible on tolerance but produces a sliver of a band
+        # next to a near-identical one.
+        band_low = D_prev / (1.0 - var)
+
+        D_next = pick(band_low, cap)
+
+        if D_next is None:
+            D_next = _max_next_dose(D_prev, var, conc)
+
+        # Must strictly advance by at least one dose step
+        if D_next <= D_prev + 1e-9:
+            D_next = D_prev + get_dose_step_mg(D_prev, conc)
+
+        band_doses.append(round(D_next, 10))
+
+        if D_next / (1.0 - var) >= max_dose:
+            break
+
+        if len(band_doses) > 100_000:
+            print("WARNING: exceeded 100 000 band limit. Stopping.", file=sys.stderr)
+            break
+
+    return band_doses
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # BUILD FULL BAND TABLE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_bands(
-    drug:         dict,
-    vial_sizes:   Optional[list] = None,
-    max_per_vial: int = 8,
-    vials_shared: bool = False,
-    cost_per_mg:  Optional[float] = None,
-    strict:       bool = True,
-    vial_aware:   bool = False,
+    drug:           dict,
+    vial_sizes:     Optional[list] = None,
+    max_per_vial:   int = 8,
+    vials_shared:   bool = False,
+    cost_per_mg:    Optional[float] = None,
+    strict:         bool = True,
+    vial_aware:     bool = False,
+    route_profile:  Optional[str] = None,
+    max_syringes:   int = DEFAULT_MAX_SYRINGES,
+    split_strategy: str = "equal",
 ) -> list[dict]:
     """
     Return band-row dicts for one drug config entry.
@@ -488,6 +866,12 @@ def build_bands(
 
     vials_shared=True suppresses vial-aware placement — see
     `vial_aware_applies` for why, and call it to report the override.
+
+    With route_profile set (e.g. "iv_push") band doses are placed so that a dose
+    needing more than one syringe divides into syringes that each sit on a
+    readable graduation, and the hazardous fill limit applies. See
+    `generate_band_doses_split_aware`. Default is off — the flag changes
+    published output, so it is opt-in per call.
     """
     name      = drug["drug_name"].strip()
     conc      = float(drug["concentration_mg_per_ml"])
@@ -502,6 +886,24 @@ def build_bands(
 
     var        = VARIANCE[dtype]
 
+    # ── Multi-syringe setup ──────────────────────────────────────────────────
+    route_profile = parse_route_profile(route_profile)
+
+    # Both are placement constraints, and each moves the band dose onto its own
+    # lattice. Taking the intersection is usually empty, and letting one win
+    # silently would emit a table that satisfies neither claim. Vial
+    # SUBSTITUTION conflicts just as badly: it reseats a dose after placement,
+    # which is exactly what would break a split that placement had arranged.
+    if route_profile and vial_sizes:
+        raise ValueError(
+            f"{name}: vial sizes and route_profile cannot be combined. Vial "
+            f"placement and split-aware placement each move the band dose onto "
+            f"a different lattice, and vial substitution reseats a dose after "
+            f"placement, undoing any split arranged for it. Choose one."
+        )
+
+    syringes = build_syringe_set(route_profile) if route_profile else None
+
     # ── Vial optimisation setup ──────────────────────────────────────────────
     use_vials = bool(vial_sizes)
     vial_combos: list[tuple[float, str]] = []
@@ -513,11 +915,22 @@ def build_bands(
         )
 
     placing_on_vials = vial_aware_applies(vial_sizes, vial_aware, vials_shared)
+    splitting        = split_aware_applies(route_profile, vial_sizes)
 
     if placing_on_vials:
         band_doses = generate_band_doses_vial_aware(
             min_dose, max_dose, conc, var,
             sorted({dose for dose, _ in vial_combos}),
+        )
+    elif splitting:
+        # Headroom above max_dose: the final band dose can exceed it, since the
+        # loop stops only once the band's upper coverage reaches max_dose.
+        ceiling = max_dose * (1.0 + var) / (1.0 - var)
+        band_doses = generate_band_doses_split_aware(
+            min_dose, max_dose, conc, var,
+            enumerate_split_totals(
+                conc, ceiling, syringes, max_syringes, split_strategy
+            ),
         )
     else:
         band_doses = generate_band_doses(min_dose, max_dose, conc, var)
@@ -624,6 +1037,24 @@ def build_bands(
         volume_mL = round(D / conc, 4)
         vol_step  = get_vol_step_mL(D, conc)
 
+        # ── Multi-syringe split ──────────────────────────────────────────────
+        # Empty strings when splitting is inactive, matching the vial columns.
+        route_out         = ""
+        n_syringes_out    = ""
+        syringe_split_out = ""
+        split_aligned_out = ""
+        exceeds_max_out   = ""
+
+        if syringes is not None:
+            split = describe_split(
+                D, conc, syringes, max_syringes, split_strategy
+            )
+            route_out         = route_profile
+            n_syringes_out    = split["n_syringes"]
+            syringe_split_out = format_split(split)
+            split_aligned_out = split["aligned"]
+            exceeds_max_out   = split["exceeds_max"]
+
         # ── Actual variance at boundaries ────────────────────────────────────
         # Below: patient at from_mg receives D  →  positive = over-dose
         # Above: patient at to_a_mg receives D  →  negative = under-dose
@@ -658,13 +1089,21 @@ def build_bands(
             "waste_pct":               waste_pct_val,
             "waste_cost":              waste_cost_val,
             "vial_optimized":          vial_optimized,
+            # multi-syringe splitting — empty strings without a route_profile
+            "route_profile":           route_out,
+            "n_syringes":              n_syringes_out,
+            "syringe_split":           syringe_split_out,
+            "split_aligned":           split_aligned_out,
+            "exceeds_max_syringes":    exceeds_max_out,
             # Provenance: a downloaded table is often detached from the tool
             # that produced it, so it has to carry its own version.
             "algorithm_version":       __version__,
         })
 
     if strict:
-        failures = verify_bands(rows, var, conc)
+        failures = verify_bands(
+            rows, var, conc, syringes, max_syringes, split_strategy
+        )
         if failures:
             shown = "\n  - ".join(failures[:5])
             more  = (f"\n  … and {len(failures) - 5} further failure(s)"
@@ -687,13 +1126,22 @@ def build_bands(
 # STRICT VERIFICATION OF THE THREE GUARANTEED PROPERTIES
 # ─────────────────────────────────────────────────────────────────────────────
 
-def verify_bands(rows: list[dict], var: float, conc: float) -> list[str]:
+def verify_bands(
+    rows:           list[dict],
+    var:            float,
+    conc:           float,
+    syringes:       Optional[list] = None,
+    max_syringes:   int = DEFAULT_MAX_SYRINGES,
+    split_strategy: str = "equal",
+) -> list[str]:
     """
     Check the properties the algorithm guarantees, from the PUBLISHED values
     (i.e. the boundaries as rounded for presentation, not the exact reals):
 
       1. Dispensability — every band volume is an exact multiple of the
-         graduation step declared for its own volume tier.
+         graduation step declared for its own volume tier. Where the band is
+         prepared as a split (`syringes` given), the per-syringe fills are
+         checked against their own barrels instead — see below.
       2. Tolerance — variance at both published boundaries is ≤ var.
       3. Coverage — no gap between adjacent bands.
 
@@ -718,11 +1166,55 @@ def verify_bands(rows: list[dict], var: float, conc: float) -> list[str]:
         # so no partial volume is measured and the syringe graduation is not
         # the binding constraint. Bands where vial optimisation found no
         # zero-waste fit keep the graduation-aligned dose and are still checked.
-        if row.get("vial_optimized") is not True:
+        # A band placed on a clean split is exempt for a different reason:
+        # each aliquot is measured in its own barrel, so the binding grid is
+        # that barrel's graduation, not the tier step for the combined volume.
+        # 3 x 7.4 mL is dispensable even though 22.2 mL is not a multiple of the
+        # 1 mL step that applies at 22.2 mL. Those fills are checked below
+        # instead, which is a stricter test, not a waiver.
+        if row.get("vial_optimized") is not True and row.get("split_aligned") is not True:
             if abs(vol / vstep - round(vol / vstep)) > 1e-6:
                 failures.append(
                     f"band {D:g} mg = {vol:g} mL is not a multiple of the "
                     f"{vstep:g} mL graduation step"
+                )
+
+        # 1b. Split dispensability
+        if syringes is not None and row.get("route_profile"):
+            split = describe_split(D, conc, syringes, max_syringes, split_strategy)
+            fills = split["fills"]
+
+            if abs(sum(fills) - vol) > 1e-6:
+                failures.append(
+                    f"band {D:g} mg: split {format_split(split)} sums to "
+                    f"{sum(fills):g} mL, not the band volume {vol:g} mL"
+                )
+
+            for fill in fills:
+                entry = select_syringe(fill, syringes)
+                if entry is None:
+                    failures.append(
+                        f"band {D:g} mg: fill of {fill:g} mL exceeds the largest "
+                        f"usable syringe volume ({max_fill_mL(syringes):g} mL)"
+                    )
+                elif not _on_graduation(fill, entry[1]):
+                    failures.append(
+                        f"band {D:g} mg: fill of {fill:g} mL is not a multiple of "
+                        f"the {entry[1]:g} mL graduation of the {entry[0]:g} mL "
+                        f"syringe it must be drawn in"
+                    )
+
+            fewest = _min_syringes(vol, syringes)
+            if split["n_syringes"] != fewest:
+                failures.append(
+                    f"band {D:g} mg: split uses {split['n_syringes']} syringes "
+                    f"where {fewest} would hold {vol:g} mL"
+                )
+
+            if split["exceeds_max"] and row.get("exceeds_max_syringes") is not True:
+                failures.append(
+                    f"band {D:g} mg needs {split['n_syringes']} syringes, over "
+                    f"the limit of {max_syringes}, and is not flagged"
                 )
 
         # 2. Tolerance at the published boundaries
@@ -900,6 +1392,9 @@ BAND_FIELDS = [
     "variance_below_pct", "variance_above_pct", "within_tolerance",
     # vial optimisation — empty strings for drugs without vial_sizes_mg
     "vial_combination", "waste_mg", "waste_pct", "waste_cost", "vial_optimized",
+    # multi-syringe splitting — empty strings for drugs without a route_profile
+    "route_profile", "n_syringes", "syringe_split", "split_aligned",
+    "exceeds_max_syringes",
     # provenance — deliberately NOT added to the Cerner export, which must
     # match the standardised dose range screen field for field
     "algorithm_version",
