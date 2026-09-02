@@ -353,4 +353,100 @@ def test_route_profile_parsing(raw, expected):
 def test_unknown_split_strategy_is_rejected():
     with pytest.raises(ValueError, match="unknown split_strategy"):
         build_bands(config(2.0, "traditional", 40.0, 160.0),
-                    route_profile="iv_push", split_strategy="balanced")
+                    route_profile="iv_push", split_strategy="proportional")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THE `balanced` STRATEGY
+#
+# Fills may differ by one graduation, so the total need only be a multiple of
+# the graduation rather than of k x graduation. The lattice therefore does not
+# coarsen with k, which is where the saving comes from.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def balanced_rows(conc, lo, hi, dtype="traditional", **kw):
+    return build_bands(config(conc, dtype, lo, hi), route_profile="iv_push",
+                       split_strategy="balanced", **kw)
+
+
+@pytest.mark.parametrize("conc,lo,hi,dtype", SPLIT_CASES)
+def test_balanced_fills_differ_by_at_most_one_graduation(conc, lo, hi, dtype):
+    for row in balanced_rows(conc, lo, hi, dtype):
+        if not row["split_aligned"]:
+            continue
+        fills = fills_of(row)
+        found = barrel_for(max(fills))
+        assert found is not None
+        _capacity, graduation, _usable = found
+        assert max(fills) - min(fills) <= graduation + 1e-9, row["syringe_split"]
+        for fill in fills:
+            assert on_graduation(fill, graduation), row["syringe_split"]
+
+
+@pytest.mark.parametrize("conc,lo,hi,dtype", SPLIT_CASES)
+def test_balanced_keeps_every_fill_in_one_barrel(conc, lo, hi, dtype):
+    """
+    Two volumes on a label is the cost `balanced` asks the user to accept. Two
+    volumes AND two syringe sizes is not, so the split is confined to one
+    barrel.
+    """
+    for row in balanced_rows(conc, lo, hi, dtype):
+        if not row["split_aligned"]:
+            continue
+        sizes = {barrel_for(fill)[0] for fill in fills_of(row)}
+        assert len(sizes) == 1, f"{row['syringe_split']} spans {sizes}"
+
+
+@pytest.mark.parametrize("conc,lo,hi,dtype", SPLIT_CASES)
+def test_balanced_is_never_more_bands_than_equal(conc, lo, hi, dtype):
+    """
+    Relaxing a constraint cannot remove candidates, so it cannot cost bands.
+    This is the property that justifies offering it at all.
+    """
+    equal = split_rows(conc, lo, hi, dtype)
+    assert len(balanced_rows(conc, lo, hi, dtype)) <= len(equal)
+
+
+@pytest.mark.parametrize("conc,lo,hi,dtype", SPLIT_CASES)
+def test_balanced_holds_the_split_guarantees(conc, lo, hi, dtype):
+    """Conservation, capacity and minimality, exactly as for `equal`."""
+    largest = max(usable for _c, _g, usable in barrels())
+    for row in balanced_rows(conc, lo, hi, dtype):
+        fills = fills_of(row)
+        assert abs(sum(fills) - row["volume_mL"]) < 1e-6
+        assert row["n_syringes"] == max(1, math.ceil(row["volume_mL"] / largest - 1e-9))
+        for fill in fills:
+            found = barrel_for(fill)
+            assert found is not None
+            capacity, _graduation, usable = found
+            assert fill <= usable + 1e-9
+            assert fill <= HAZARDOUS_FILL_FRACTION * capacity + 1e-9
+
+
+@pytest.mark.parametrize("conc,lo,hi,dtype", SPLIT_CASES)
+def test_balanced_keeps_tolerance_and_coverage(conc, lo, hi, dtype):
+    result = validate_tolerance_and_coverage(balanced_rows(conc, lo, hi, dtype),
+                                             VARIANCE[dtype])
+    assert result["violations"] == []
+    assert result["gaps"] == []
+
+
+def test_balanced_enumeration_is_a_superset_of_equal():
+    syringes = build_syringe_set("iv_push")
+    equal = {d for d, _k in enumerate_split_totals(2.0, 400.0, syringes,
+                                                   strategy="equal")}
+    balanced = {d for d, _k in enumerate_split_totals(2.0, 400.0, syringes,
+                                                      strategy="balanced")}
+    assert equal <= balanced
+    assert len(balanced) > len(equal)
+
+
+def test_equal_remains_the_default():
+    """The default must not change under anyone's feet — it is the safer claim."""
+    cfg = config(2.0, "traditional", 60.0, 220.0)
+    default = build_bands(cfg, route_profile="iv_push")
+    explicit = build_bands(cfg, route_profile="iv_push", split_strategy="equal")
+    assert [r["band_dose_mg"] for r in default] == [r["band_dose_mg"] for r in explicit]
+    for row in default:
+        if row["n_syringes"] > 1 and row["split_aligned"]:
+            assert len(set(fills_of(row))) == 1

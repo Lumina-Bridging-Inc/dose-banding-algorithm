@@ -54,6 +54,9 @@ from pathlib import Path
 #                 (`build_bands(..., vial_aware=True)`). Default is off, so
 #                 2.0.1 output is reproduced byte for byte unless the caller
 #                 asks for the new behaviour.
+#   2.2.0.dev1  — UNRELEASED: adds the `balanced` split strategy, which lets
+#                 the fills differ by one graduation instead of requiring them
+#                 identical. Much cheaper in bands; `equal` stays the default.
 #   2.2.0.dev0  — UNRELEASED: adds opt-in split-aware band placement for doses
 #                 that need more than one syringe (`build_bands(...,
 #                 route_profile=...)`), with the BC Cancer 75% hazardous fill
@@ -67,7 +70,7 @@ from pathlib import Path
 #                 producing a 2 mg-wide band next to a near-identical one.
 #                 Changes vial_aware=True output only; the default is untouched.
 # Bump this in the same commit as the release tag.
-__version__ = "2.2.0.dev0"
+__version__ = "2.2.0.dev1"
 from typing import Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -529,7 +532,14 @@ ROUTE_PROFILES: dict[str, Optional[float]] = {
 
 DEFAULT_MAX_SYRINGES: int = 4
 
-SPLIT_STRATEGIES = ("equal",)
+# `equal` requires k identical fills, so the total volume must be a multiple of
+# k x graduation — a lattice that coarsens as k grows. `balanced` allows the
+# fills to differ by a single graduation, which drops the requirement back to
+# "total is a multiple of the graduation" and so does NOT coarsen with k. That
+# is much cheaper in bands, but it hands nursing two different numbers on one
+# label, which is a practice question rather than a mathematical one. `equal`
+# stays the default for that reason.
+SPLIT_STRATEGIES = ("equal", "balanced")
 
 
 def parse_route_profile(raw) -> Optional[str]:
@@ -670,6 +680,39 @@ def describe_split(
                 "exceeds_max": exceeds,
             }
 
+    elif strategy == "balanced":
+        # Fills differ by at most one graduation. Writing the volume as
+        # N graduations, N = k*base + extra, gives `extra` fills of
+        # (base+1) graduations and the rest of `base` — the flattest split that
+        # lands every fill on the grid.
+        #
+        # Barrels are tried smallest first, so the one chosen is the smallest
+        # that fits, and BOTH fills are required to sit inside its reign. A
+        # split whose two fills wanted different barrels would be labelled with
+        # two syringe sizes as well as two volumes, which is not what
+        # "balanced" is meant to buy.
+        for capacity, graduation, reign_low, reign_high in syringes:
+            units = volume_mL / graduation
+            if abs(units - round(units)) > 1e-6:
+                continue
+            base, extra = divmod(int(round(units)), k)
+            if base < 1:
+                continue
+            small = base * graduation
+            large = (base + 1) * graduation
+            if small <= reign_low + 1e-9:
+                continue
+            if (large if extra else small) > reign_high + 1e-9:
+                continue
+            return {
+                "n_syringes":  k,
+                "fills":       [round(large, 9)] * extra
+                               + [round(small, 9)] * (k - extra),
+                "capacity":    capacity,
+                "aligned":     True,
+                "exceeds_max": exceeds,
+            }
+
     fills = _aliquot_split(volume_mL, syringes)
     caps = {select_syringe(f, syringes)[0] for f in fills
             if select_syringe(f, syringes) is not None}
@@ -709,6 +752,10 @@ def enumerate_split_totals(
     the reign, so the graduation is too, and no dose is generated on a
     graduation finer than the barrel it would actually be drawn in.
 
+    For `balanced`, also take the k-1 totals that add one further graduation at
+    a time, which is what allowing the fills to differ by one mark buys. Both
+    fills must still sit inside the same barrel's reign.
+
     A candidate is kept only when k is the MINIMUM number of barrels its total
     volume forces. Without that guard the enumeration is happy to return
     46.4 mg as 4 × 5.8 mL when 23.2 mL fits a single barrel — arithmetically
@@ -725,20 +772,29 @@ def enumerate_split_totals(
     best: dict[float, int] = {}
 
     for k in range(1, max_syringes + 1):
-        for _capacity, graduation, reign_low, reign_high in syringes:
+        for _capacity, graduation, reign_low, reign_high in syringes:  # noqa: B007
             first = math.floor(reign_low / graduation + 1e-9) + 1
             last  = math.floor(reign_high / graduation + 1e-9)
             for n in range(max(first, 1), last + 1):
                 fill  = n * graduation
-                total = k * fill
-                if total > ceiling_vol + 1e-9:
+                base_total = k * fill
+                if base_total > ceiling_vol + 1e-9:
                     break
-                # Minimum-syringe guard.
-                if k != max(1, math.ceil(total / cap - 1e-9)):
-                    continue
-                dose = round(conc * total, 9)
-                if dose not in best or k < best[dose]:
-                    best[dose] = k
+                # `equal` takes only the flat total; `balanced` also takes the
+                # totals that raise one fill at a time by a single graduation.
+                extras = 1 if strategy == "equal" else k
+                for extra in range(extras):
+                    if extra and (n + 1) * graduation > reign_high + 1e-9:
+                        break
+                    total = base_total + extra * graduation
+                    if total > ceiling_vol + 1e-9:
+                        break
+                    # Minimum-syringe guard.
+                    if k != max(1, math.ceil(total / cap - 1e-9)):
+                        continue
+                    dose = round(conc * total, 9)
+                    if dose not in best or k < best[dose]:
+                        best[dose] = k
 
     return sorted(best.items())
 
