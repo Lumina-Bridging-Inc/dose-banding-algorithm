@@ -54,28 +54,23 @@ from pathlib import Path
 #                 (`build_bands(..., vial_aware=True)`). Default is off, so
 #                 2.0.1 output is reproduced byte for byte unless the caller
 #                 asks for the new behaviour.
-#   2.2.0.dev2  — UNRELEASED: reports `divides_equally` per band — whether
-#                 `total volume / syringe count` is itself measurable, which is
-#                 all many HIS implementations can compute. `balanced` fails it
-#                 for most multi-syringe bands, so the flag has to be published
-#                 rather than left implicit.
-#   2.2.0.dev1  — UNRELEASED: adds the `balanced` split strategy, which lets
-#                 the fills differ by one graduation instead of requiring them
-#                 identical. Much cheaper in bands; `equal` stays the default.
-#   2.2.0.dev0  — UNRELEASED: adds opt-in split-aware band placement for doses
-#                 that need more than one syringe (`build_bands(...,
+#   2.2.0       — current: adds opt-in split-aware band placement for doses
+#                 needing more than one syringe (`build_bands(...,
 #                 route_profile=...)`), with the BC Cancer 75% hazardous fill
-#                 limit and route volume caps. Default is off, so 2.1.1 output
-#                 is reproduced byte for byte unless the caller asks for it.
-#                 The .dev0 marker is deliberate: this version stamp is written
-#                 into every band CSV, so it must never claim a released
-#                 version while the code is still being tested.
+#                 limit and route volume caps. Two split strategies: `equal`
+#                 (default, k identical fills) and `balanced` (fills may differ
+#                 by one graduation — far fewer bands, but see below). Each band
+#                 reports `divides_equally`, whether `total volume / syringe
+#                 count` is itself measurable, since that is all many HIS
+#                 implementations can compute and `balanced` fails it for most
+#                 multi-syringe bands. Default is off, so 2.1.1 output is
+#                 reproduced byte for byte unless the caller asks for it.
 #   2.1.1       — vial-aware placement now requires a band dose to sit
 #                 inside its own band. 2.1.0 could seat one beneath its range,
 #                 producing a 2 mg-wide band next to a near-identical one.
 #                 Changes vial_aware=True output only; the default is untouched.
 # Bump this in the same commit as the release tag.
-__version__ = "2.2.0.dev2"
+__version__ = "2.2.0"
 from typing import Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
