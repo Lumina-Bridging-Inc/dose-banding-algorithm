@@ -39,6 +39,7 @@ from dose_banding import (
     build_syringe_set,
     enumerate_split_totals,
     generate_band_doses,
+    parse_max_syringe_volume,
     parse_route_profile,
     validate_tolerance_and_coverage,
 )
@@ -62,15 +63,17 @@ SPLIT_CASES = [
 # INDEPENDENT RE-DERIVATION FROM THE DECLARED INVENTORY
 # ─────────────────────────────────────────────────────────────────────────────
 
-def barrels(route: str = "iv_push", fraction: float = HAZARDOUS_FILL_FRACTION):
+def barrels(route: str = "iv_push", fraction: float = HAZARDOUS_FILL_FRACTION,
+            cap=None):
     """
     Re-derive the usable barrels from SYRINGE_INVENTORY.
 
     Deliberately does not call `build_syringe_set` — that is the code under
     test. Returns (capacity, graduation, largest usable fill), smallest first,
-    with barrels that no volume could ever select removed.
+    with barrels that no volume could ever select removed. `cap` is a site's
+    own per-syringe maximum, replacing the route profile's.
     """
-    route_max = ROUTE_PROFILES[route]
+    route_max = ROUTE_PROFILES[route] if cap is None else cap
     out, reachable = [], 0.0
     for capacity, graduation, override in sorted(SYRINGE_INVENTORY):
         fill = override if override is not None else fraction * capacity
@@ -83,9 +86,9 @@ def barrels(route: str = "iv_push", fraction: float = HAZARDOUS_FILL_FRACTION):
     return out
 
 
-def barrel_for(fill_mL: float, route: str = "iv_push"):
+def barrel_for(fill_mL: float, route: str = "iv_push", cap=None):
     """Smallest barrel that can hold `fill_mL`, or None."""
-    for capacity, graduation, usable in barrels(route):
+    for capacity, graduation, usable in barrels(route, cap=cap):
         if fill_mL <= usable + 1e-9:
             return capacity, graduation, usable
     return None
@@ -517,3 +520,138 @@ def test_a_single_syringe_band_always_divides_equally():
     for row in split_rows(2.0, 40.0, 160.0):
         if row["n_syringes"] == 1:
             assert row["divides_equally"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A SITE'S OWN CAP PER SYRINGE
+#
+# Sites differ: one caps a syringe at 30 mL, another at 45 mL. The cap decides
+# the syringe count a downstream system derives — ceil(volume / cap) — so it
+# moves the whole placement lattice, not just a label. Everything S1-S4 claim
+# has to hold under any cap a site can set, measured against THAT cap.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SITE_CAPS = [30.0, 45.0]
+
+
+@pytest.mark.parametrize("conc,lo,hi,dtype", SPLIT_CASES)
+def test_the_route_default_cap_given_explicitly_changes_nothing(conc, lo, hi, dtype):
+    """Setting the profile's own figure must reproduce the profile exactly."""
+    default = split_rows(conc, lo, hi, dtype)
+    explicit = split_rows(conc, lo, hi, dtype,
+                          max_syringe_volume_mL=ROUTE_PROFILES["iv_push"])
+    assert default == explicit
+
+
+@pytest.mark.parametrize("cap", SITE_CAPS)
+@pytest.mark.parametrize("conc,lo,hi,dtype", SPLIT_CASES)
+def test_split_guarantees_hold_under_a_site_cap(conc, lo, hi, dtype, cap):
+    """S1-S4, and tolerance and coverage, re-derived against the site's cap."""
+    rows = split_rows(conc, lo, hi, dtype, max_syringe_volume_mL=cap)
+    largest = max(usable for _c, _g, usable in barrels(cap=cap))
+    assert largest == cap
+
+    for row in rows:
+        fills = fills_of(row)
+        assert abs(sum(fills) - row["volume_mL"]) < 1e-6                    # S4
+        assert row["n_syringes"] == max(                                     # S2
+            1, math.ceil(row["volume_mL"] / cap - 1e-9))
+        for fill in fills:                                                   # S3
+            found = barrel_for(fill, cap=cap)
+            assert found is not None, f"{fill} mL fits no barrel under {cap} mL"
+            capacity, _g, _usable = found
+            assert fill <= cap + 1e-9
+            assert fill <= HAZARDOUS_FILL_FRACTION * capacity + 1e-9
+        if row["split_aligned"]:                                             # S1
+            assert len(set(fills)) == 1
+            assert on_graduation(fills[0], barrel_for(fills[0], cap=cap)[1])
+
+    result = validate_tolerance_and_coverage(rows, VARIANCE[dtype])
+    assert result["violations"] == []
+    assert result["gaps"] == []
+
+
+@pytest.mark.parametrize("cap", SITE_CAPS)
+@pytest.mark.parametrize("conc,lo,hi,dtype", SPLIT_CASES)
+def test_divides_equally_is_measured_against_the_site_cap(conc, lo, hi, dtype, cap):
+    """
+    The flag is only meaningful if it uses the count the site's system derives.
+    Under `equal`, every in-limit band must still be reproducible there.
+    """
+    for row in split_rows(conc, lo, hi, dtype, max_syringe_volume_mL=cap):
+        k = max(1, math.ceil(row["volume_mL"] / cap - 1e-9))
+        fill = row["volume_mL"] / k
+        found = barrel_for(fill, cap=cap)
+        expected = found is not None and on_graduation(fill, found[1])
+        assert row["divides_equally"] == expected, row["syringe_split"]
+        if row["n_syringes"] > 1 and not row["exceeds_max_syringes"]:
+            assert row["divides_equally"], row["syringe_split"]
+
+
+@pytest.mark.parametrize("cap", [8.0, 12.0, 15.0, 20.0, 22.0, 25.0, 30.0,
+                                 35.0, 40.0, 44.0, 45.0])
+def test_any_reachable_cap_builds_a_sound_table(cap):
+    rows = split_rows(2.0, 40.0, 300.0, max_syringe_volume_mL=cap,
+                      max_syringes=10)
+    assert all(r["max_syringe_volume_mL"] == cap for r in rows)
+    result = validate_tolerance_and_coverage(rows, VARIANCE["traditional"])
+    assert result["violations"] == [] and result["gaps"] == []
+
+
+def test_a_larger_cap_needs_fewer_syringes():
+    """30 vs 45 mL, doxorubicin 40-160 mg at 2 mg/mL — the reported case."""
+    at_30 = split_rows(2.0, 40.0, 160.0, max_syringe_volume_mL=30.0)
+    at_45 = split_rows(2.0, 40.0, 160.0, max_syringe_volume_mL=45.0)
+    multi = lambda rows: sum(1 for r in rows if r["n_syringes"] > 1)  # noqa: E731
+    assert multi(at_45) < multi(at_30)
+
+
+def test_the_cap_is_recorded_on_every_row():
+    for row in split_rows(2.0, 40.0, 160.0, max_syringe_volume_mL=45.0):
+        assert row["max_syringe_volume_mL"] == 45.0
+    # the profile's own cap is recorded when none is given
+    for row in split_rows(2.0, 40.0, 160.0):
+        assert row["max_syringe_volume_mL"] == ROUTE_PROFILES["iv_push"]
+    # and nothing is recorded without a route
+    for row in build_bands(config(2.0, "traditional", 40.0, 160.0)):
+        assert row["max_syringe_volume_mL"] == ""
+
+
+def test_the_uncapped_route_records_the_fill_limit_it_actually_hits():
+    rows = split_rows(2.0, 40.0, 160.0, route="syringe")
+    reachable = max(HAZARDOUS_FILL_FRACTION * c for c, _g, _o in SYRINGE_INVENTORY)
+    assert all(r["max_syringe_volume_mL"] == reachable for r in rows)
+
+
+def test_a_cap_the_fill_limit_cannot_reach_is_refused():
+    """
+    60 mL at 75% is 45 mL. Clamping 50 to 45 would publish a table labelled
+    with a policy it was not built for.
+    """
+    with pytest.raises(ValueError, match="cannot be reached"):
+        split_rows(2.0, 40.0, 160.0, max_syringe_volume_mL=50.0)
+
+
+def test_a_cap_off_the_graduation_is_refused():
+    with pytest.raises(ValueError, match="not on a graduation"):
+        split_rows(2.0, 40.0, 160.0, max_syringe_volume_mL=37.5)
+
+
+def test_a_cap_without_a_route_is_refused():
+    with pytest.raises(ValueError, match="without a route_profile"):
+        build_bands(config(2.0, "traditional", 40.0, 160.0),
+                    max_syringe_volume_mL=45.0)
+
+
+@pytest.mark.parametrize("raw", ["0", "-30", "abc", "inf"])
+def test_a_nonsense_cap_is_refused(raw):
+    with pytest.raises(ValueError, match="max_syringe_volume_mL"):
+        split_rows(2.0, 40.0, 160.0, max_syringe_volume_mL=raw)
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None, None), ("", None), ("  ", None), ("nan", None), (float("nan"), None),
+    ("45", 45.0), (" 30 ", 30.0), (45, 45.0),
+])
+def test_cap_parsing(raw, expected):
+    assert parse_max_syringe_volume(raw) == expected
