@@ -54,7 +54,7 @@ from pathlib import Path
 #                 (`build_bands(..., vial_aware=True)`). Default is off, so
 #                 2.0.1 output is reproduced byte for byte unless the caller
 #                 asks for the new behaviour.
-#   2.2.0       — current: adds opt-in split-aware band placement for doses
+#   2.2.0       — adds opt-in split-aware band placement for doses
 #                 needing more than one syringe (`build_bands(...,
 #                 route_profile=...)`), with the BC Cancer 75% hazardous fill
 #                 limit and route volume caps. Two split strategies: `equal`
@@ -65,12 +65,19 @@ from pathlib import Path
 #                 implementations can compute and `balanced` fails it for most
 #                 multi-syringe bands. Default is off, so 2.1.1 output is
 #                 reproduced byte for byte unless the caller asks for it.
+#   2.3.0       — current: a site sets its own maximum volume per syringe
+#                 (`build_bands(..., max_syringe_volume_mL=...)`), since sites
+#                 cap a syringe at 30 mL or 45 mL. Needs a route_profile; a cap
+#                 no syringe can reach, or one off a graduation, is refused
+#                 rather than clamped. Each band reports the effective cap in
+#                 `max_syringe_volume_mL`. Without the argument, output is the
+#                 2.2.0 output byte for byte.
 #   2.1.1       — vial-aware placement now requires a band dose to sit
 #                 inside its own band. 2.1.0 could seat one beneath its range,
 #                 producing a 2 mg-wide band next to a near-identical one.
 #                 Changes vial_aware=True output only; the default is untouched.
 # Bump this in the same commit as the release tag.
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 from typing import Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -525,6 +532,12 @@ SYRINGE_INVENTORY: list[tuple[float, float, Optional[float]]] = [
 # Route profile → maximum volume per syringe handed to nursing (mL), or None
 # for "the fill limit is the only constraint". The push cap is ergonomic and is
 # not waived by a closed-system device, so it is orthogonal to the fill fraction.
+#
+# These are DEFAULTS. Sites set their own cap — one caps an IV push at 30 mL,
+# another at 45 mL — and `build_bands(max_syringe_volume_mL=...)` overrides the
+# profile's figure for a single table. The cap is not cosmetic: the syringe
+# count a downstream system derives is `ceil(volume / cap)`, so the whole
+# placement lattice, and `divides_equally`, move with it.
 ROUTE_PROFILES: dict[str, Optional[float]] = {
     "iv_push": 30.0,
     "syringe": None,
@@ -560,6 +573,31 @@ def parse_route_profile(raw) -> Optional[str]:
     return name
 
 
+def parse_max_syringe_volume(raw) -> Optional[float]:
+    """
+    Parse a site's maximum volume per syringe (mL). Empty/absent → None, which
+    keeps the route profile's own cap. Anything else must be a positive, finite
+    number; whether the inventory can actually reach it is checked against the
+    syringe set in `resolve_syringe_cap`, not here.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text or text.lower() == "nan":
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError(
+            f"max_syringe_volume_mL must be a number of mL — got {text!r}"
+        ) from None
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            f"max_syringe_volume_mL must be a positive number of mL — got {text!r}"
+        )
+    return value
+
+
 def usable_fill_mL(
     capacity:      float,
     override:      Optional[float],
@@ -577,6 +615,7 @@ def build_syringe_set(
     route_profile: str,
     inventory:     Optional[list] = None,
     fill_fraction: float = HAZARDOUS_FILL_FRACTION,
+    max_volume_mL: Optional[float] = None,
 ) -> list[tuple[float, float, float, float]]:
     """
     Return the usable barrels for a route, as
@@ -587,8 +626,12 @@ def build_syringe_set(
     so the one whose graduation applies. Barrels whose usable fill is no greater
     than a smaller barrel's are shadowed and dropped: under a 30 mL push cap the
     50 and 60 mL barrels both cap out at 30 mL, so the 60 is never selected.
+
+    `max_volume_mL`, when given, replaces the route profile's cap with a site's
+    own. It is applied exactly as the profile cap is, and is not validated here
+    — see `resolve_syringe_cap` for the checks a caller should make first.
     """
-    route_max = ROUTE_PROFILES[route_profile]
+    route_max = ROUTE_PROFILES[route_profile] if max_volume_mL is None else max_volume_mL
     inv = SYRINGE_INVENTORY if inventory is None else inventory
 
     out: list[tuple[float, float, float, float]] = []
@@ -605,6 +648,59 @@ def build_syringe_set(
 def max_fill_mL(syringes: list) -> float:
     """Largest volume any single barrel may hold on this route."""
     return max(high for _, _, _, high in syringes)
+
+
+def resolve_syringe_cap(
+    route_profile: str,
+    max_volume_mL: Optional[float] = None,
+    inventory:     Optional[list] = None,
+    fill_fraction: float = HAZARDOUS_FILL_FRACTION,
+) -> list[tuple[float, float, float, float]]:
+    """
+    Build the syringe set for a route under a site's own cap, refusing a cap
+    the table could not honestly claim to have been built for.
+
+    Two ways a requested cap can fail to be the cap actually applied:
+
+      * UNREACHABLE. The fill limit binds first. With the default inventory the
+        largest barrel is 60 mL at 75%, so nothing can hold more than 45 mL; a
+        50 mL cap would silently produce a 45 mL table labelled 50.
+      * OFF-GRADUATION. The cap is not a mark on the barrel that would hold it.
+        A 37.5 mL cap in a 1 mL-graduated barrel cannot be drawn, and since the
+        syringe count is `ceil(volume / cap)`, every count derived from it would
+        be measured against a volume nobody can fill.
+
+    Both are raised rather than rounded, because the cap is a site policy and
+    the table records it — rounding would publish a policy the site did not set.
+    """
+    syringes = build_syringe_set(route_profile, inventory, fill_fraction, max_volume_mL)
+    if max_volume_mL is None:
+        return syringes
+
+    reachable = max_fill_mL(
+        build_syringe_set(route_profile, inventory, fill_fraction, float("inf"))
+    )
+    if max_volume_mL > reachable + 1e-9:
+        largest = max(c for c, _g, _o in
+                      (SYRINGE_INVENTORY if inventory is None else inventory))
+        raise ValueError(
+            f"a maximum of {max_volume_mL:g} mL per syringe cannot be reached: "
+            f"no stocked barrel may hold more than {reachable:g} mL (the "
+            f"{largest:g} mL barrel at the {fill_fraction:.0%} hazardous fill "
+            f"limit). Set {reachable:g} mL or less."
+        )
+
+    entry = select_syringe(max_volume_mL, syringes)
+    if entry is None or not _on_graduation(max_volume_mL, entry[1]):
+        grad = entry[1] if entry is not None else None
+        raise ValueError(
+            f"a maximum of {max_volume_mL:g} mL per syringe is not on a "
+            f"graduation"
+            + (f" of the {entry[0]:g} mL barrel that would hold it "
+               f"({grad:g} mL steps)" if entry is not None else "")
+            + ", so no fill could be drawn to it. Use a volume on the marks."
+        )
+    return syringes
 
 
 def select_syringe(fill_mL: float, syringes: list) -> Optional[tuple]:
@@ -933,6 +1029,7 @@ def build_bands(
     route_profile:  Optional[str] = None,
     max_syringes:   int = DEFAULT_MAX_SYRINGES,
     split_strategy: str = "equal",
+    max_syringe_volume_mL: Optional[float] = None,
 ) -> list[dict]:
     """
     Return band-row dicts for one drug config entry.
@@ -956,6 +1053,12 @@ def build_bands(
     readable graduation, and the hazardous fill limit applies. See
     `generate_band_doses_split_aware`. Default is off — the flag changes
     published output, so it is opt-in per call.
+
+    max_syringe_volume_mL replaces the route profile's per-syringe cap with a
+    site's own (e.g. 45 mL where the profile says 30). It needs a route, and a
+    cap the stocked barrels cannot reach, or that is not on a graduation, is
+    refused — see `resolve_syringe_cap`. The cap actually applied is written to
+    every row as `max_syringe_volume_mL`.
     """
     name      = drug["drug_name"].strip()
     conc      = float(drug["concentration_mg_per_ml"])
@@ -972,6 +1075,14 @@ def build_bands(
 
     # ── Multi-syringe setup ──────────────────────────────────────────────────
     route_profile = parse_route_profile(route_profile)
+    max_syringe_volume_mL = parse_max_syringe_volume(max_syringe_volume_mL)
+
+    if max_syringe_volume_mL is not None and not route_profile:
+        raise ValueError(
+            f"{name}: a maximum volume per syringe was given without a "
+            f"route_profile. The cap only applies when doses are split across "
+            f"syringes; set a route, or clear the cap."
+        )
 
     # Both are placement constraints, and each moves the band dose onto its own
     # lattice. Taking the intersection is usually empty, and letting one win
@@ -986,7 +1097,11 @@ def build_bands(
             f"placement, undoing any split arranged for it. Choose one."
         )
 
-    syringes = build_syringe_set(route_profile) if route_profile else None
+    try:
+        syringes = (resolve_syringe_cap(route_profile, max_syringe_volume_mL)
+                    if route_profile else None)
+    except ValueError as exc:
+        raise ValueError(f"{name}: {exc}") from None
 
     # ── Vial optimisation setup ──────────────────────────────────────────────
     use_vials = bool(vial_sizes)
@@ -1124,6 +1239,7 @@ def build_bands(
         # ── Multi-syringe split ──────────────────────────────────────────────
         # Empty strings when splitting is inactive, matching the vial columns.
         route_out         = ""
+        syringe_cap_out   = ""
         n_syringes_out    = ""
         syringe_split_out = ""
         split_aligned_out = ""
@@ -1135,6 +1251,7 @@ def build_bands(
                 D, conc, syringes, max_syringes, split_strategy
             )
             route_out         = route_profile
+            syringe_cap_out   = max_fill_mL(syringes)
             n_syringes_out    = split["n_syringes"]
             syringe_split_out = format_split(split)
             split_aligned_out = split["aligned"]
@@ -1177,6 +1294,10 @@ def build_bands(
             "vial_optimized":          vial_optimized,
             # multi-syringe splitting — empty strings without a route_profile
             "route_profile":           route_out,
+            # The cap the table was built for. Recorded because a downstream
+            # system derives the syringe count from it, so a table is only
+            # reproducible at a site whose cap matches this figure.
+            "max_syringe_volume_mL":   syringe_cap_out,
             "n_syringes":              n_syringes_out,
             "syringe_split":           syringe_split_out,
             "split_aligned":           split_aligned_out,
@@ -1480,8 +1601,8 @@ BAND_FIELDS = [
     # vial optimisation — empty strings for drugs without vial_sizes_mg
     "vial_combination", "waste_mg", "waste_pct", "waste_cost", "vial_optimized",
     # multi-syringe splitting — empty strings for drugs without a route_profile
-    "route_profile", "n_syringes", "syringe_split", "split_aligned",
-    "exceeds_max_syringes", "divides_equally",
+    "route_profile", "max_syringe_volume_mL", "n_syringes", "syringe_split",
+    "split_aligned", "exceeds_max_syringes", "divides_equally",
     # provenance — deliberately NOT added to the Cerner export, which must
     # match the standardised dose range screen field for field
     "algorithm_version",
