@@ -54,7 +54,7 @@ from pathlib import Path
 #                 (`build_bands(..., vial_aware=True)`). Default is off, so
 #                 2.0.1 output is reproduced byte for byte unless the caller
 #                 asks for the new behaviour.
-#   2.2.0       — current: adds opt-in split-aware band placement for doses
+#   2.2.0       — adds opt-in split-aware band placement for doses
 #                 needing more than one syringe (`build_bands(...,
 #                 route_profile=...)`), with the BC Cancer 75% hazardous fill
 #                 limit and route volume caps. Two split strategies: `equal`
@@ -65,12 +65,19 @@ from pathlib import Path
 #                 implementations can compute and `balanced` fails it for most
 #                 multi-syringe bands. Default is off, so 2.1.1 output is
 #                 reproduced byte for byte unless the caller asks for it.
+#   2.3.0       — current: a site sets its own maximum volume per syringe
+#                 (`build_bands(..., max_syringe_volume_mL=...)`), since sites
+#                 cap a syringe at 30 mL or 45 mL. Needs a route_profile; a cap
+#                 no syringe can reach, or one off a graduation, is refused
+#                 rather than clamped. Each band reports the effective cap in
+#                 `max_syringe_volume_mL`. Without the argument, output is the
+#                 2.2.0 output byte for byte.
 #   2.1.1       — vial-aware placement now requires a band dose to sit
 #                 inside its own band. 2.1.0 could seat one beneath its range,
 #                 producing a 2 mg-wide band next to a near-identical one.
 #                 Changes vial_aware=True output only; the default is untouched.
 # Bump this in the same commit as the release tag.
-__version__ = "2.3.0.dev0"
+__version__ = "2.3.0"
 from typing import Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
